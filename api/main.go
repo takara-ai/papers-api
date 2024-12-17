@@ -12,7 +12,7 @@ import (
 	"golang.org/x/net/html"
 	"os"
 	"github.com/redis/go-redis/v9"
-	"encoding/json"
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -20,6 +20,10 @@ const (
 	updateInterval = 6 * time.Hour
 	cacheKey       = "hf_papers_cache"
 	cacheDuration  = 6 * time.Hour
+	envKeyRedisURL        = "KV_URL"
+	envKeyRedisToken      = "KV_REST_API_TOKEN"
+	envKeyRedisReadToken  = "KV_REST_API_READ_ONLY_TOKEN"
+	envKeyRedisRestURL    = "KV_REST_API_URL"
 )
 
 type Paper struct {
@@ -248,34 +252,81 @@ var mux *http.ServeMux
 var feedManager *FeedManager
 var rdb *redis.Client
 var ctx = context.Background()
+var redisConnected bool
+
+func validateEnv() error {
+	required := []string{
+		envKeyRedisURL,
+		envKeyRedisToken,
+		envKeyRedisReadToken,
+		envKeyRedisRestURL,
+	}
+
+	missing := []string{}
+	for _, env := range required {
+		if value := os.Getenv(env); value == "" {
+			missing = append(missing, env)
+		} else {
+			// Log that we found the environment variable (but not its value)
+			log.Printf("[INFO] Found environment variable: %s", env)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required environment variables: %v", missing)
+	}
+
+	return nil
+}
 
 func initRedis() {
 	// Parse the Redis URL from KV_URL environment variable
-	redisURL := os.Getenv("KV_URL")
+	redisURL := os.Getenv(envKeyRedisURL)
+	log.Printf("[DEBUG] Attempting Redis connection with URL: %s", redisURL)
+	
 	if redisURL == "" {
-		log.Printf("Warning: KV_URL environment variable not set")
+		log.Printf("[ERROR] %s environment variable not set", envKeyRedisURL)
 		return
 	}
 
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
-		log.Printf("Error parsing Redis URL: %v", err)
+		log.Printf("[ERROR] Error parsing Redis URL: %v", err)
+		log.Printf("[DEBUG] URL format should be: rediss://username:password@host:port")
 		return
 	}
 
+	log.Printf("[DEBUG] Successfully parsed Redis URL. Connecting to %s", opt.Addr)
+	
 	rdb = redis.NewClient(opt)
+
+	// Test the connection with context and timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	// Test the connection
 	_, err = rdb.Ping(ctx).Result()
 	if err != nil {
-		log.Printf("Error connecting to Redis: %v", err)
+		log.Printf("[ERROR] Error connecting to Redis: %v", err)
+		log.Printf("[DEBUG] Redis client options: %+v", opt)
 		return
 	}
 
-	log.Printf("Successfully connected to Redis")
+	redisConnected = true
+	log.Printf("[INFO] Successfully connected to Redis at %s", opt.Addr)
 }
 
 func getCachedFeed() ([]byte, error) {
+	// If Redis is not connected, generate feed directly
+	if !redisConnected {
+		log.Printf("Redis not connected, generating feed directly")
+		papers, err := scrapePapers()
+		if err != nil {
+			return nil, err
+		}
+		return generateRSS(papers)
+	}
+
 	// Try to get from cache first
 	cachedData, err := rdb.Get(ctx, cacheKey).Bytes()
 	if err == nil {
@@ -293,20 +344,75 @@ func getCachedFeed() ([]byte, error) {
 		return nil, err
 	}
 
-	// Store in cache
-	err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
-	if err != nil {
-		log.Printf("Failed to cache feed: %v", err)
+	// Only try to cache if Redis is connected
+	if redisConnected {
+		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+		if err != nil {
+			log.Printf("Failed to cache feed: %v", err)
+		}
 	}
 
 	return feed, nil
 }
 
+// Add this function to test a direct connection
+func testDirectRedisConnection() {
+	directURL := "rediss://default:AVbPAAIjcDE0YjQ1NWIyMzJkMjk0NmVjOTRjZGViMWViYWI0MDQwZHAxMA@noble-catfish-22223.upstash.io:6379"
+	
+	opt, err := redis.ParseURL(directURL)
+	if err != nil {
+		log.Printf("[DEBUG] Direct connection - Error parsing URL: %v", err)
+		return
+	}
+
+	client := redis.NewClient(opt)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = client.Ping(ctx).Result()
+	if err != nil {
+		log.Printf("[DEBUG] Direct connection - Error connecting: %v", err)
+		return
+	}
+
+	log.Printf("[DEBUG] Direct connection successful!")
+}
+
+func loadEnvFile() {
+	// Try to load .env from current directory
+	err := godotenv.Load()
+	if err != nil {
+		// Try to load from parent directory
+		err = godotenv.Load("../.env")
+		if err != nil {
+			log.Printf("[DEBUG] No .env file found in current or parent directory: %v", err)
+			return
+		}
+	}
+	log.Printf("[INFO] Successfully loaded environment variables from .env file")
+}
+
 func init() {
-	log.SetFlags(0)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.SetOutput(os.Stdout)
 	
+	// Load environment variables
+	loadEnvFile()
+	
+	// Try both connection methods
+	log.Printf("[DEBUG] Testing direct Redis connection...")
+	testDirectRedisConnection()
+	
+	log.Printf("[DEBUG] Testing connection via environment variables...")
 	initRedis()
+	
+	// Validate environment variables first
+	if err := validateEnv(); err != nil {
+		log.Printf("[WARNING] Environment validation failed: %v", err)
+		// Don't fatal here, as we want the service to start even without Redis
+	}
 	
 	mux = http.NewServeMux()
 
@@ -325,56 +431,125 @@ func init() {
 
 	// Modified status handler
 	mux.HandleFunc("/api/status", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		lastUpdate, err := rdb.Get(ctx, "last_update").Time()
-		if err != nil {
+		var lastUpdate time.Time
+		var redisError string
+
+		if redisConnected {
+			var err error
+			lastUpdate, err = rdb.Get(ctx, "last_update").Time()
+			if err != nil {
+				lastUpdate = time.Now()
+				redisError = err.Error()
+			}
+		} else {
 			lastUpdate = time.Now()
+			redisError = "Redis not connected"
 		}
 		
 		nextUpdate := lastUpdate.Add(updateInterval)
 		
 		w.Header().Set("Content-Type", "application/json")
-		response := fmt.Sprintf(`{"last_update":"%s","next_update":"%s","status":"active"}`,
+		response := fmt.Sprintf(`{
+			"last_update": "%s",
+			"next_update": "%s",
+			"status": "active",
+			"redis_connected": %v,
+			"redis_error": %q,
+			"cache_enabled": %v
+		}`,
 			lastUpdate.Format(time.RFC3339),
-			nextUpdate.Format(time.RFC3339))
+			nextUpdate.Format(time.RFC3339),
+			redisConnected,
+			redisError,
+			redisConnected && redisError == "")
 		w.Write([]byte(response))
 	}))
 
 	// Add a manual update endpoint (protected by a secret key)
 	mux.HandleFunc("/api/update", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Check for secret key
-		if r.Header.Get("X-Update-Key") != os.Getenv("UPDATE_SECRET") {
+		if r.Header.Get("X-Update-Key") != os.Getenv(envKeyRedisToken) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
 		papers, err := scrapePapers()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Error scraping papers: %v", err)
+			http.Error(w, fmt.Sprintf("Error scraping papers: %v", err), http.StatusInternalServerError)
 			return
 		}
 
 		feed, err := generateRSS(papers)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Error generating RSS: %v", err)
+			http.Error(w, fmt.Sprintf("Error generating RSS: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		// Update cache
-		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		var cacheError string
+		// Only try to cache if Redis is connected
+		if redisConnected {
+			err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+			if err != nil {
+				cacheError = err.Error()
+				log.Printf("Error caching feed: %v", err)
+			} else {
+				// Update last update time only if cache update succeeded
+				err = rdb.Set(ctx, "last_update", time.Now(), 0).Err()
+				if err != nil {
+					log.Printf("Error updating last_update time: %v", err)
+				}
+			}
+		} else {
+			cacheError = "Redis not connected"
 		}
 
-		// Update last update time
-		rdb.Set(ctx, "last_update", time.Now(), 0)
-
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"updated"}`))
+		// Return success with cache status
+		w.Header().Set("Content-Type", "application/json")
+		response := fmt.Sprintf(`{
+			"status": "updated",
+			"cache_updated": %v,
+			"cache_error": %q,
+			"papers_count": %d
+		}`,
+			cacheError == "",
+			cacheError,
+			len(papers))
+		w.Write([]byte(response))
 	}))
 
 	mux.HandleFunc("/api/health", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		
+		var redisHealth string
+		if redisConnected {
+			_, err := rdb.Ping(ctx).Result()
+			if err != nil {
+				redisHealth = fmt.Sprintf("error: %v", err)
+			} else {
+				redisHealth = "ok"
+			}
+		} else {
+			redisHealth = "not connected"
+		}
+		
+		// Add environment check
+		envStatus := "ok"
+		if err := validateEnv(); err != nil {
+			envStatus = fmt.Sprintf("error: %v", err)
+		}
+		
+		response := fmt.Sprintf(`{
+			"status": "ok",
+			"redis": %q,
+			"environment": %q,
+			"timestamp": %q
+		}`,
+			redisHealth,
+			envStatus,
+			time.Now().Format(time.RFC3339))
+		w.Write([]byte(response))
 	}))
 }
 
