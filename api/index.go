@@ -584,9 +584,10 @@ func cleanup() {
 
 // Handler handles requests to /api/main
 func Handler(w http.ResponseWriter, r *http.Request) {
-    // Initialize if not already initialized
-    if mux == nil {
-        initialize()
-    }
-    mux.ServeHTTP(w, r)
+	log.Printf("[DEBUG] Received request for path: %s", r.URL.Path)
+	// Initialize if not already initialized
+	if mux == nil {
+		initialize()
+	}
+	mux.ServeHTTP(w, r)
 }
