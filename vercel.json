@@ -1,0 +1,17 @@
+{
+  "builds": [
+    { "src": "api/*.go", "use": "@vercel/go" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" }
+  ],
+  "crons": [
+    {
+      "path": "/api/update",
+      "schedule": "0 */6 * * *",
+      "headers": {
+        "X-Update-Key": "@KV_REST_API_TOKEN"
+      }
+    }
+  ]
+} 

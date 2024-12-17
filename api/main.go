@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"log"
@@ -10,11 +11,15 @@ import (
 	"time"
 	"golang.org/x/net/html"
 	"os"
+	"github.com/redis/go-redis/v9"
+	"encoding/json"
 )
 
 const (
-	baseURL     = "https://huggingface.co/papers"
+	baseURL        = "https://huggingface.co/papers"
 	updateInterval = 6 * time.Hour
+	cacheKey       = "hf_papers_cache"
+	cacheDuration  = 6 * time.Hour
 )
 
 type Paper struct {
@@ -238,60 +243,93 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func main() {
-	// Configure logging
-	log.SetFlags(0)
-	log.SetOutput(os.Stdout)
-	
-	log.Println("[INFO] Starting HTTP server in development mode")
-	log.Println("[INFO] Version: Go standard library HTTP server")
-	
-	feedManager := NewFeedManager()
+// Create a global mux that can be used by both local server and Vercel handler
+var mux *http.ServeMux
+var feedManager *FeedManager
+var rdb *redis.Client
+var ctx = context.Background()
 
-	// Initial feed update
+func initRedis() {
+	// Parse the Redis URL from KV_URL environment variable
+	redisURL := os.Getenv("KV_URL")
+	if redisURL == "" {
+		log.Printf("Warning: KV_URL environment variable not set")
+		return
+	}
+
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Printf("Error parsing Redis URL: %v", err)
+		return
+	}
+
+	rdb = redis.NewClient(opt)
+
+	// Test the connection
+	_, err = rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Printf("Error connecting to Redis: %v", err)
+		return
+	}
+
+	log.Printf("Successfully connected to Redis")
+}
+
+func getCachedFeed() ([]byte, error) {
+	// Try to get from cache first
+	cachedData, err := rdb.Get(ctx, cacheKey).Bytes()
+	if err == nil {
+		return cachedData, nil
+	}
+
+	// If cache miss or error, generate new feed
 	papers, err := scrapePapers()
 	if err != nil {
-		log.Fatalf("Initial scrape failed: %v", err)
+		return nil, err
 	}
 
 	feed, err := generateRSS(papers)
 	if err != nil {
-		log.Fatalf("Failed to generate initial RSS: %v", err)
+		return nil, err
 	}
-	feedManager.updateFeed(feed)
 
-	// Start background updater
-	go func() {
-		ticker := time.NewTicker(updateInterval)
-		for range ticker.C {
-			papers, err := scrapePapers()
-			if err != nil {
-				log.Printf("Failed to scrape papers: %v", err)
-				continue
-			}
+	// Store in cache
+	err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+	if err != nil {
+		log.Printf("Failed to cache feed: %v", err)
+	}
 
-			feed, err := generateRSS(papers)
-			if err != nil {
-				log.Printf("Failed to generate RSS: %v", err)
-				continue
-			}
+	return feed, nil
+}
 
-			feedManager.updateFeed(feed)
-			log.Printf("[INFO] Feed updated successfully with %d papers", len(papers))
+func init() {
+	log.SetFlags(0)
+	log.SetOutput(os.Stdout)
+	
+	initRedis()
+	
+	mux = http.NewServeMux()
+
+	// Modified feed handler
+	mux.HandleFunc("/api/feed", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		feed, err := getCachedFeed()
+		if err != nil {
+			log.Printf("Error getting feed: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
 		}
-	}()
 
-	// Set up HTTP server with standard library
-	mux := http.NewServeMux()
-
-	// Register routes with logging middleware
-	mux.HandleFunc("/feed", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/rss+xml")
-		w.Write(feedManager.getCurrentFeed())
+		w.Write(feed)
 	}))
 
-	mux.HandleFunc("/status", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		lastUpdate := feedManager.getLastUpdate()
+	// Modified status handler
+	mux.HandleFunc("/api/status", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		lastUpdate, err := rdb.Get(ctx, "last_update").Time()
+		if err != nil {
+			lastUpdate = time.Now()
+		}
+		
 		nextUpdate := lastUpdate.Add(updateInterval)
 		
 		w.Header().Set("Content-Type", "application/json")
@@ -301,21 +339,63 @@ func main() {
 		w.Write([]byte(response))
 	}))
 
-	mux.HandleFunc("/health", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Add a manual update endpoint (protected by a secret key)
+	mux.HandleFunc("/api/update", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		// Check for secret key
+		if r.Header.Get("X-Update-Key") != os.Getenv("UPDATE_SECRET") {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		papers, err := scrapePapers()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		feed, err := generateRSS(papers)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Update cache
+		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Update last update time
+		rdb.Set(ctx, "last_update", time.Now(), 0)
+
 		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"updated"}`))
 	}))
 
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
+	mux.HandleFunc("/api/health", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+func main() {
+	// Only start the HTTP server if we're not running on Vercel
+	if os.Getenv("VERCEL") == "" {
+		log.Println("[INFO] Starting HTTP server in development mode")
+		log.Println("[INFO] Version: Go standard library HTTP server")
+		
+		// Log registered routes
+		log.Println("[INFO] Registered routes:")
+		log.Println("[INFO] GET    /api/feed")
+		log.Println("[INFO] GET    /api/status")
+		log.Println("[INFO] GET    /api/health")
+		
+		server := &http.Server{
+			Addr:    ":8080",
+			Handler: mux,
+		}
+		
+		log.Printf("[INFO] Listening and serving HTTP on %s\n", server.Addr)
+		log.Fatal(server.ListenAndServe())
 	}
-
-	// Log registered routes
-	log.Println("[INFO] Registered routes:")
-	log.Println("[INFO] GET    /feed")
-	log.Println("[INFO] GET    /status")
-	log.Println("[INFO] GET    /health")
-	log.Printf("[INFO] Listening and serving HTTP on %s\n", server.Addr)
-
-	log.Fatal(server.ListenAndServe())
 }
