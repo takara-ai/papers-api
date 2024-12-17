@@ -3,7 +3,7 @@
     { "src": "api/*.go", "use": "@vercel/go" }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "/api/main" }
+    { "src": "/api/(.*)", "dest": "/api/$1" }
   ],
   "crons": [
     {
