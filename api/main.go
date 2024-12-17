@@ -446,9 +446,9 @@ func initialize() {
 
 		w.Header().Set("Content-Type", "application/rss+xml")
 		w.Write(feed)
-	}))
+	})))
 
-	mux.HandleFunc("/api/status", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/status", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		var lastUpdate time.Time
 		var redisError string
 
@@ -481,9 +481,9 @@ func initialize() {
 			redisError,
 			redisConnected && redisError == "")
 		w.Write([]byte(response))
-	}))
+	})))
 
-	mux.HandleFunc("/api/update", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/update", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a Vercel cron job or an authenticated request
 		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
 		hasValidToken := r.Header.Get("X-Update-Key") == os.Getenv(envKeyRedisToken)
@@ -537,9 +537,9 @@ func initialize() {
 			cacheError,
 			len(papers))
 		w.Write([]byte(response))
-	}))
+	})))
 
-	mux.HandleFunc("/api/health", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/health", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		
 		var redisHealth string
@@ -570,7 +570,7 @@ func initialize() {
 			envStatus,
 			time.Now().Format(time.RFC3339))
 		w.Write([]byte(response))
-	}))
+	})))
 }
 
 // Add cleanup function
@@ -580,14 +580,4 @@ func cleanup() {
 			log.Printf("[ERROR] Failed to close Redis connection: %v", err)
 		}
 	}
-}
-
-// Update Handler in index.go to use cleanup
-func Handler(w http.ResponseWriter, r *http.Request) {
-	// Initialize if not already initialized
-	if mux == nil {
-		initialize()
-		defer cleanup()
-	}
-	mux.ServeHTTP(w, r)
 }
