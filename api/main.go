@@ -436,7 +436,7 @@ func initialize() {
 	mux = http.NewServeMux()
 
 	// Register routes
-	mux.HandleFunc("/api/feed", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/feed", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		feed, err := getCachedFeed()
 		if err != nil {
 			log.Printf("Error getting feed: %v", err)
@@ -448,7 +448,7 @@ func initialize() {
 		w.Write(feed)
 	})))
 
-	mux.HandleFunc("/api/status", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/status", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		var lastUpdate time.Time
 		var redisError string
 
@@ -483,7 +483,7 @@ func initialize() {
 		w.Write([]byte(response))
 	})))
 
-	mux.HandleFunc("/api/update", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/update", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a Vercel cron job or an authenticated request
 		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
 		hasValidToken := r.Header.Get("X-Update-Key") == os.Getenv(envKeyRedisToken)
@@ -539,7 +539,7 @@ func initialize() {
 		w.Write([]byte(response))
 	})))
 
-	mux.HandleFunc("/api/health", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		
 		var redisHealth string
