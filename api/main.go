@@ -1,4 +1,4 @@
-package main
+package handler
 
 import (
 	"context"
@@ -24,6 +24,9 @@ const (
 	envKeyRedisToken      = "KV_REST_API_TOKEN"
 	envKeyRedisReadToken  = "KV_REST_API_READ_ONLY_TOKEN"
 	envKeyRedisRestURL    = "KV_REST_API_URL"
+	scrapeTimeout = 30 * time.Second
+	maxPapers     = 50  // Limit number of papers to prevent excessive scraping
+	redisTimeout = 5 * time.Second
 )
 
 type Paper struct {
@@ -85,9 +88,13 @@ func (fm *FeedManager) getLastUpdate() time.Time {
 }
 
 func scrapeAbstract(url string) (string, error) {
-	resp, err := http.Get(url)
+	client := &http.Client{
+		Timeout: scrapeTimeout,
+	}
+	
+	resp, err := client.Get(url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to fetch abstract: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -130,9 +137,13 @@ func extractText(n *html.Node) string {
 }
 
 func scrapePapers() ([]Paper, error) {
-	resp, err := http.Get(baseURL)
+	client := &http.Client{
+		Timeout: scrapeTimeout,
+	}
+	
+	resp, err := client.Get(baseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch papers: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -179,6 +190,11 @@ func scrapePapers() ([]Paper, error) {
 		}
 	}
 	crawler(doc)
+
+	// Limit number of papers
+	if len(papers) > maxPapers {
+		papers = papers[:maxPapers]
+	}
 
 	return papers, nil
 }
@@ -317,67 +333,51 @@ func initRedis() {
 }
 
 func getCachedFeed() ([]byte, error) {
-	// If Redis is not connected, generate feed directly
 	if !redisConnected {
-		log.Printf("Redis not connected, generating feed directly")
-		papers, err := scrapePapers()
-		if err != nil {
-			return nil, err
-		}
-		return generateRSS(papers)
+		log.Printf("[INFO] Redis not connected, generating feed directly")
+		return generateFeedDirect()
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisTimeout)
+	defer cancel()
 
 	// Try to get from cache first
 	cachedData, err := rdb.Get(ctx, cacheKey).Bytes()
 	if err == nil {
+		log.Printf("[DEBUG] Serving cached feed")
 		return cachedData, nil
 	}
+	if err != redis.Nil {
+		log.Printf("[ERROR] Redis error: %v", err)
+	}
 
-	// If cache miss or error, generate new feed
-	papers, err := scrapePapers()
+	// Cache miss or error, generate new feed
+	feed, err := generateFeedDirect()
 	if err != nil {
 		return nil, err
 	}
 
-	feed, err := generateRSS(papers)
-	if err != nil {
-		return nil, err
-	}
-
-	// Only try to cache if Redis is connected
+	// Try to cache the new feed
 	if redisConnected {
+		ctx, cancel := context.WithTimeout(context.Background(), redisTimeout)
+		defer cancel()
+		
 		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
 		if err != nil {
-			log.Printf("Failed to cache feed: %v", err)
+			log.Printf("[ERROR] Failed to cache feed: %v", err)
 		}
 	}
 
 	return feed, nil
 }
 
-// Add this function to test a direct connection
-func testDirectRedisConnection() {
-	directURL := "rediss://default:AVbPAAIjcDE0YjQ1NWIyMzJkMjk0NmVjOTRjZGViMWViYWI0MDQwZHAxMA@noble-catfish-22223.upstash.io:6379"
-	
-	opt, err := redis.ParseURL(directURL)
+func generateFeedDirect() ([]byte, error) {
+	papers, err := scrapePapers()
 	if err != nil {
-		log.Printf("[DEBUG] Direct connection - Error parsing URL: %v", err)
-		return
+		return nil, fmt.Errorf("failed to scrape papers: %w", err)
 	}
 
-	client := redis.NewClient(opt)
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err = client.Ping(ctx).Result()
-	if err != nil {
-		log.Printf("[DEBUG] Direct connection - Error connecting: %v", err)
-		return
-	}
-
-	log.Printf("[DEBUG] Direct connection successful!")
+	return generateRSS(papers)
 }
 
 func loadEnvFile() {
@@ -394,30 +394,49 @@ func loadEnvFile() {
 	log.Printf("[INFO] Successfully loaded environment variables from .env file")
 }
 
-func init() {
+// Add CORS middleware
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Update-Key")
+		
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		next(w, r)
+	}
+}
+
+// Move initialization to a separate function that can be called from Handler
+func initialize() {
+	// Only initialize once
+	if mux != nil {
+		return
+	}
+
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.SetOutput(os.Stdout)
 	
 	// Load environment variables
 	loadEnvFile()
 	
-	// Try both connection methods
-	log.Printf("[DEBUG] Testing direct Redis connection...")
-	testDirectRedisConnection()
-	
+	// Initialize Redis connection
 	log.Printf("[DEBUG] Testing connection via environment variables...")
 	initRedis()
 	
-	// Validate environment variables first
+	// Validate environment variables
 	if err := validateEnv(); err != nil {
 		log.Printf("[WARNING] Environment validation failed: %v", err)
-		// Don't fatal here, as we want the service to start even without Redis
 	}
 	
+	// Initialize router
 	mux = http.NewServeMux()
 
-	// Modified feed handler
-	mux.HandleFunc("/api/feed", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Register routes
+	mux.HandleFunc("/api/feed", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		feed, err := getCachedFeed()
 		if err != nil {
 			log.Printf("Error getting feed: %v", err)
@@ -429,7 +448,6 @@ func init() {
 		w.Write(feed)
 	}))
 
-	// Modified status handler
 	mux.HandleFunc("/api/status", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		var lastUpdate time.Time
 		var redisError string
@@ -465,7 +483,6 @@ func init() {
 		w.Write([]byte(response))
 	}))
 
-	// Add a manual update endpoint (protected by a secret key)
 	mux.HandleFunc("/api/update", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a Vercel cron job or an authenticated request
 		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
@@ -556,24 +573,21 @@ func init() {
 	}))
 }
 
-func main() {
-	// Only start the HTTP server if we're not running on Vercel
-	if os.Getenv("VERCEL") == "" {
-		log.Println("[INFO] Starting HTTP server in development mode")
-		log.Println("[INFO] Version: Go standard library HTTP server")
-		
-		// Log registered routes
-		log.Println("[INFO] Registered routes:")
-		log.Println("[INFO] GET    /api/feed")
-		log.Println("[INFO] GET    /api/status")
-		log.Println("[INFO] GET    /api/health")
-		
-		server := &http.Server{
-			Addr:    ":8080",
-			Handler: mux,
+// Add cleanup function
+func cleanup() {
+	if rdb != nil {
+		if err := rdb.Close(); err != nil {
+			log.Printf("[ERROR] Failed to close Redis connection: %v", err)
 		}
-		
-		log.Printf("[INFO] Listening and serving HTTP on %s\n", server.Addr)
-		log.Fatal(server.ListenAndServe())
 	}
+}
+
+// Update Handler in index.go to use cleanup
+func Handler(w http.ResponseWriter, r *http.Request) {
+	// Initialize if not already initialized
+	if mux == nil {
+		initialize()
+		defer cleanup()
+	}
+	mux.ServeHTTP(w, r)
 }
