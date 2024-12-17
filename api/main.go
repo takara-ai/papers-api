@@ -467,8 +467,11 @@ func init() {
 
 	// Add a manual update endpoint (protected by a secret key)
 	mux.HandleFunc("/api/update", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Check for secret key
-		if r.Header.Get("X-Update-Key") != os.Getenv(envKeyRedisToken) {
+		// Check if this is a Vercel cron job or an authenticated request
+		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
+		hasValidToken := r.Header.Get("X-Update-Key") == os.Getenv(envKeyRedisToken)
+		
+		if !isVercelCron && !hasValidToken {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
