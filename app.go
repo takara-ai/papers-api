@@ -8,9 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/PuerkitoBio/goquery"
-	"github.com/gin-gonic/gin"
+	"golang.org/x/net/html"
+	"os"
 )
 
 const (
@@ -83,15 +82,42 @@ func scrapeAbstract(url string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return "", err
 	}
 
-	abstract := doc.Find("div.pb-8.pr-4.md\\:pr-16").Text()
-	abstract = strings.TrimPrefix(abstract, "Abstract\n")
+	var abstract string
+	var crawler func(*html.Node)
+	crawler = func(node *html.Node) {
+		if node.Type == html.ElementNode && node.Data == "div" {
+			for _, attr := range node.Attr {
+				if attr.Key == "class" && strings.Contains(attr.Val, "pb-8 pr-4 md:pr-16") {
+					abstract = extractText(node)
+					return
+				}
+			}
+		}
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			crawler(c)
+		}
+	}
+	crawler(doc)
+
+	abstract = strings.TrimPrefix(abstract, "Abstract")
 	abstract = strings.ReplaceAll(abstract, "\n", " ")
 	return strings.TrimSpace(abstract), nil
+}
+
+func extractText(n *html.Node) string {
+	var text string
+	if n.Type == html.TextNode {
+		return n.Data
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		text += extractText(c)
+	}
+	return text
 }
 
 func scrapePapers() ([]Paper, error) {
@@ -101,32 +127,49 @@ func scrapePapers() ([]Paper, error) {
 	}
 	defer resp.Body.Close()
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	var papers []Paper
-	doc.Find("h3").Each(func(i int, s *goquery.Selection) {
-		if a := s.Find("a"); a.Length() > 0 {
-			title := strings.TrimSpace(a.Text())
-			href, _ := a.Attr("href")
-			url := fmt.Sprintf("https://huggingface.co%s", href)
-			
-			abstract, err := scrapeAbstract(url)
-			if err != nil {
-				log.Printf("Failed to extract abstract for %s: %v", url, err)
-				abstract = ""
+	var crawler func(*html.Node)
+	crawler = func(node *html.Node) {
+		if node.Type == html.ElementNode && node.Data == "h3" {
+			var title, href string
+			for c := node.FirstChild; c != nil; c = c.NextSibling {
+				if c.Type == html.ElementNode && c.Data == "a" {
+					for _, attr := range c.Attr {
+						if attr.Key == "href" {
+							href = attr.Val
+						}
+					}
+					title = extractText(c)
+					break
+				}
 			}
+			
+			if href != "" {
+				url := fmt.Sprintf("https://huggingface.co%s", href)
+				abstract, err := scrapeAbstract(url)
+				if err != nil {
+					log.Printf("Failed to extract abstract for %s: %v", url, err)
+					abstract = ""
+				}
 
-			papers = append(papers, Paper{
-				Title:    title,
-				URL:      url,
-				Abstract: abstract,
-				PubDate:  time.Now().UTC(),
-			})
+				papers = append(papers, Paper{
+					Title:    strings.TrimSpace(title),
+					URL:      url,
+					Abstract: abstract,
+					PubDate:  time.Now().UTC(),
+				})
+			}
 		}
-	})
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			crawler(c)
+		}
+	}
+	crawler(doc)
 
 	return papers, nil
 }
@@ -157,7 +200,52 @@ func generateRSS(papers []Paper) ([]byte, error) {
 	return xml.MarshalIndent(rss, "", "  ")
 }
 
+// LoggingMiddleware wraps an http.HandlerFunc and provides request logging
+func LoggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		
+		// Create a custom response writer to capture the status code
+		rw := &responseWriter{
+			ResponseWriter: w,
+			statusCode:    http.StatusOK,
+		}
+		
+		next(rw, r)
+		
+		duration := time.Since(start)
+		
+		// Format similar to Gin's logging
+		log.Printf("[HTTP] %s | %d | %12v | %15s | %-7s %s\n",
+			time.Now().Format("2006/01/02 - 15:04:05"),
+			rw.statusCode,
+			duration,
+			r.RemoteAddr,
+			r.Method,
+			r.URL.Path,
+		)
+	}
+}
+
+// responseWriter is a custom ResponseWriter that captures the status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
+	// Configure logging
+	log.SetFlags(0)
+	log.SetOutput(os.Stdout)
+	
+	log.Println("[INFO] Starting HTTP server in development mode")
+	log.Println("[INFO] Version: Go standard library HTTP server")
+	
 	feedManager := NewFeedManager()
 
 	// Initial feed update
@@ -189,32 +277,45 @@ func main() {
 			}
 
 			feedManager.updateFeed(feed)
-			log.Printf("Feed updated successfully with %d papers", len(papers))
+			log.Printf("[INFO] Feed updated successfully with %d papers", len(papers))
 		}
 	}()
 
-	// Set up HTTP server
-	r := gin.Default()
+	// Set up HTTP server with standard library
+	mux := http.NewServeMux()
 
-	r.GET("/feed", func(c *gin.Context) {
-		c.Data(http.StatusOK, "application/rss+xml", feedManager.getCurrentFeed())
-	})
+	// Register routes with logging middleware
+	mux.HandleFunc("/feed", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		w.Write(feedManager.getCurrentFeed())
+	}))
 
-	r.GET("/status", func(c *gin.Context) {
+	mux.HandleFunc("/status", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		lastUpdate := feedManager.getLastUpdate()
 		nextUpdate := lastUpdate.Add(updateInterval)
 		
-		c.JSON(http.StatusOK, gin.H{
-			"last_update":  lastUpdate,
-			"next_update":  nextUpdate,
-			"status":       "active",
-		})
-	})
+		w.Header().Set("Content-Type", "application/json")
+		response := fmt.Sprintf(`{"last_update":"%s","next_update":"%s","status":"active"}`,
+			lastUpdate.Format(time.RFC3339),
+			nextUpdate.Format(time.RFC3339))
+		w.Write([]byte(response))
+	}))
 
-	// Add health check endpoint
-	r.GET("/health", func(c *gin.Context) {
-		c.Status(http.StatusOK)
-	})
+	mux.HandleFunc("/health", LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
 
-	log.Fatal(r.Run(":8080"))
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	// Log registered routes
+	log.Println("[INFO] Registered routes:")
+	log.Println("[INFO] GET    /feed")
+	log.Println("[INFO] GET    /status")
+	log.Println("[INFO] GET    /health")
+	log.Printf("[INFO] Listening and serving HTTP on %s\n", server.Addr)
+
+	log.Fatal(server.ListenAndServe())
 }
