@@ -8,7 +8,7 @@
   "crons": [
     {
       "path": "/api/update",
-      "schedule": "0 */6 * * *",
+      "schedule": "0 0 * * *",
       "headers": {
         "X-Update-Key": "@KV_REST_API_TOKEN"
       }

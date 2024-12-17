@@ -17,9 +17,9 @@ import (
 
 const (
 	baseURL        = "https://huggingface.co/papers"
-	updateInterval = 6 * time.Hour
+	updateInterval = 24 * time.Hour
 	cacheKey       = "hf_papers_cache"
-	cacheDuration  = 6 * time.Hour
+	cacheDuration  = 24 * time.Hour
 	envKeyRedisURL        = "KV_URL"
 	envKeyRedisToken      = "KV_REST_API_TOKEN"
 	envKeyRedisReadToken  = "KV_REST_API_READ_ONLY_TOKEN"
