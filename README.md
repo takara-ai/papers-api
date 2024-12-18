@@ -67,7 +67,6 @@ The local server will be available at `http://localhost:3000`
 - `/api` - Health check and status
 - `/api/feed` - RSS feed of papers
 - `/api/update` - Manually trigger feed update (requires authentication)
-- `/api/health` - Detailed health check including Redis status
 
 ## Example Response
 
