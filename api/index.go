@@ -2,31 +2,24 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 	"golang.org/x/net/html"
 	"os"
 	"github.com/redis/go-redis/v9"
-	"github.com/joho/godotenv"
 )
 
 const (
-	baseURL        = "https://huggingface.co/papers"
-	updateInterval = 24 * time.Hour
-	cacheKey       = "hf_papers_cache"
-	cacheDuration  = 24 * time.Hour
-	envKeyRedisURL        = "KV_URL"
-	envKeyRedisToken      = "KV_REST_API_TOKEN"
-	envKeyRedisReadToken  = "KV_REST_API_READ_ONLY_TOKEN"
-	envKeyRedisRestURL    = "KV_REST_API_URL"
+	baseURL       = "https://huggingface.co/papers"
 	scrapeTimeout = 30 * time.Second
-	maxPapers     = 50  // Limit number of papers to prevent excessive scraping
-	redisTimeout = 5 * time.Second
+	maxPapers     = 50
+	cacheKey      = "hf_papers_cache"
+	cacheDuration = 24 * time.Hour
 )
 
 type Paper struct {
@@ -37,17 +30,16 @@ type Paper struct {
 }
 
 type RSS struct {
-	XMLName xml.Name `xml:"rss"`
-	Version string   `xml:"version,attr"`
-	Channel Channel  `xml:"channel"`
+	Version string `xml:"version"`
+	Channel Channel `xml:"channel"`
 }
 
 type Channel struct {
-	Title         string    `xml:"title"`
-	Link          string    `xml:"link"`
-	Description   string    `xml:"description"`
-	LastBuildDate string    `xml:"lastBuildDate"`
-	Items         []Item    `xml:"item"`
+	Title         string `xml:"title"`
+	Link          string `xml:"link"`
+	Description   string `xml:"description"`
+	LastBuildDate string `xml:"lastBuildDate"`
+	Items         []Item `xml:"item"`
 }
 
 type Item struct {
@@ -58,34 +50,11 @@ type Item struct {
 	GUID        string `xml:"guid"`
 }
 
-type FeedManager struct {
-	currentFeed []byte
-	lastUpdate  time.Time
-	mutex       sync.RWMutex
-}
-
-func NewFeedManager() *FeedManager {
-	return &FeedManager{}
-}
-
-func (fm *FeedManager) getCurrentFeed() []byte {
-	fm.mutex.RLock()
-	defer fm.mutex.RUnlock()
-	return fm.currentFeed
-}
-
-func (fm *FeedManager) updateFeed(feed []byte) {
-	fm.mutex.Lock()
-	defer fm.mutex.Unlock()
-	fm.currentFeed = feed
-	fm.lastUpdate = time.Now()
-}
-
-func (fm *FeedManager) getLastUpdate() time.Time {
-	fm.mutex.RLock()
-	defer fm.mutex.RUnlock()
-	return fm.lastUpdate
-}
+var (
+	rdb *redis.Client
+	ctx = context.Background()
+	redisConnected bool
+)
 
 func scrapeAbstract(url string) (string, error) {
 	client := &http.Client{
@@ -225,147 +194,63 @@ func generateRSS(papers []Paper) ([]byte, error) {
 	return xml.MarshalIndent(rss, "", "  ")
 }
 
-// LoggingMiddleware wraps an http.HandlerFunc and provides request logging
-func LoggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// Simple CORS middleware
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		
-		// Create a custom response writer to capture the status code
-		rw := &responseWriter{
-			ResponseWriter: w,
-			statusCode:    http.StatusOK,
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
 		}
-		
-		next(rw, r)
-		
-		duration := time.Since(start)
-		
-		// Format similar to Gin's logging
-		log.Printf("[HTTP] %s | %d | %12v | %15s | %-7s %s\n",
-			time.Now().Format("2006/01/02 - 15:04:05"),
-			rw.statusCode,
-			duration,
-			r.RemoteAddr,
-			r.Method,
-			r.URL.Path,
-		)
+		next(w, r)
 	}
-}
-
-// responseWriter is a custom ResponseWriter that captures the status code
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-// Create a global mux that can be used by both local server and Vercel handler
-var mux *http.ServeMux
-var feedManager *FeedManager
-var rdb *redis.Client
-var ctx = context.Background()
-var redisConnected bool
-
-func validateEnv() error {
-	required := []string{
-		envKeyRedisURL,
-		envKeyRedisToken,
-		envKeyRedisReadToken,
-		envKeyRedisRestURL,
-	}
-
-	missing := []string{}
-	for _, env := range required {
-		if value := os.Getenv(env); value == "" {
-			missing = append(missing, env)
-		} else {
-			// Log that we found the environment variable (but not its value)
-			log.Printf("[INFO] Found environment variable: %s", env)
-		}
-	}
-
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required environment variables: %v", missing)
-	}
-
-	return nil
 }
 
 func initRedis() {
-	// Parse the Redis URL from KV_URL environment variable
-	redisURL := os.Getenv(envKeyRedisURL)
-	log.Printf("[DEBUG] Attempting Redis connection with URL: %s", redisURL)
-	
+	redisURL := os.Getenv("KV_URL")
 	if redisURL == "" {
-		log.Printf("[ERROR] %s environment variable not set", envKeyRedisURL)
 		return
 	}
 
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
 		log.Printf("[ERROR] Error parsing Redis URL: %v", err)
-		log.Printf("[DEBUG] URL format should be: rediss://username:password@host:port")
 		return
 	}
 
-	log.Printf("[DEBUG] Successfully parsed Redis URL. Connecting to %s", opt.Addr)
-	
 	rdb = redis.NewClient(opt)
-
-	// Test the connection with context and timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Test the connection
-	_, err = rdb.Ping(ctx).Result()
-	if err != nil {
+	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Printf("[ERROR] Error connecting to Redis: %v", err)
-		log.Printf("[DEBUG] Redis client options: %+v", opt)
 		return
 	}
 
 	redisConnected = true
-	log.Printf("[INFO] Successfully connected to Redis at %s", opt.Addr)
+	log.Printf("[INFO] Successfully connected to Redis")
 }
 
 func getCachedFeed() ([]byte, error) {
 	if !redisConnected {
-		log.Printf("[INFO] Redis not connected, generating feed directly")
 		return generateFeedDirect()
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), redisTimeout)
-	defer cancel()
 
 	// Try to get from cache first
 	cachedData, err := rdb.Get(ctx, cacheKey).Bytes()
 	if err == nil {
-		log.Printf("[DEBUG] Serving cached feed")
 		return cachedData, nil
 	}
-	if err != redis.Nil {
-		log.Printf("[ERROR] Redis error: %v", err)
-	}
 
-	// Cache miss or error, generate new feed
+	// Cache miss, generate new feed
 	feed, err := generateFeedDirect()
 	if err != nil {
 		return nil, err
 	}
 
-	// Try to cache the new feed
+	// Cache the new feed
 	if redisConnected {
-		ctx, cancel := context.WithTimeout(context.Background(), redisTimeout)
-		defer cancel()
-		
-		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
-		if err != nil {
-			log.Printf("[ERROR] Failed to cache feed: %v", err)
-		}
+		rdb.Set(ctx, cacheKey, feed, cacheDuration)
 	}
 
 	return feed, nil
@@ -374,243 +259,56 @@ func getCachedFeed() ([]byte, error) {
 func generateFeedDirect() ([]byte, error) {
 	papers, err := scrapePapers()
 	if err != nil {
-		return nil, fmt.Errorf("failed to scrape papers: %w", err)
+		return nil, err
 	}
-
 	return generateRSS(papers)
 }
 
-func loadEnvFile() {
-	// Try to load .env from current directory
-	err := godotenv.Load()
-	if err != nil {
-		// Try to load from parent directory
-		err = godotenv.Load("../.env")
-		if err != nil {
-			log.Printf("[DEBUG] No .env file found in current or parent directory: %v", err)
-			return
-		}
-	}
-	log.Printf("[INFO] Successfully loaded environment variables from .env file")
-}
-
-// Add CORS middleware
-func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Update-Key")
-		
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		
-		next(w, r)
-	}
-}
-
-// Move initialization to a separate function that can be called from Handler
-func initialize() {
-	// Only initialize once
-	if mux != nil {
-		return
-	}
-
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.SetOutput(os.Stdout)
-	
-	// Load environment variables
-	loadEnvFile()
-	
-	// Initialize Redis connection
-	log.Printf("[DEBUG] Testing connection via environment variables...")
-	initRedis()
-	
-	// Validate environment variables
-	if err := validateEnv(); err != nil {
-		log.Printf("[WARNING] Environment validation failed: %v", err)
-	}
-	
-	// Initialize router
-	mux = http.NewServeMux()
-
-	// Root handler for API info
-	mux.HandleFunc("/api", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		response := `{
-			"status": "ok",
-			"available_endpoints": [
-				"/api/feed",
-				"/api/status",
-				"/api/health",
-				"/api/update"
-			],
-			"documentation": "https://github.com/yourusername/hf-daily-papers-feeds"
-		}`
-		w.Write([]byte(response))
-	})))
-
-	// Feed handler
-	mux.HandleFunc("/api/feed", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		feed, err := getCachedFeed()
-		if err != nil {
-			log.Printf("Error getting feed: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/rss+xml")
-		w.Write(feed)
-	})))
-
-	// Status handler
-	mux.HandleFunc("/api/status", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		var lastUpdate time.Time
-		var redisError string
-
-		if redisConnected {
-			var err error
-			lastUpdate, err = rdb.Get(ctx, "last_update").Time()
-			if err != nil {
-				lastUpdate = time.Now()
-				redisError = err.Error()
-			}
-		} else {
-			lastUpdate = time.Now()
-			redisError = "Redis not connected"
-		}
-		
-		nextUpdate := lastUpdate.Add(updateInterval)
-		
-		w.Header().Set("Content-Type", "application/json")
-		response := fmt.Sprintf(`{
-			"last_update": "%s",
-			"next_update": "%s",
-			"status": "active",
-			"redis_connected": %v,
-			"redis_error": %q,
-			"cache_enabled": %v
-		}`,
-			lastUpdate.Format(time.RFC3339),
-			nextUpdate.Format(time.RFC3339),
-			redisConnected,
-			redisError,
-			redisConnected && redisError == "")
-		w.Write([]byte(response))
-	})))
-
-	// Health handler
-	mux.HandleFunc("/api/health", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		
-		var redisHealth string
-		if redisConnected {
-			_, err := rdb.Ping(ctx).Result()
-			if err != nil {
-				redisHealth = fmt.Sprintf("error: %v", err)
-			} else {
-				redisHealth = "ok"
-			}
-		} else {
-			redisHealth = "not connected"
-		}
-		
-		// Add environment check
-		envStatus := "ok"
-		if err := validateEnv(); err != nil {
-			envStatus = fmt.Sprintf("error: %v", err)
-		}
-		
-		response := fmt.Sprintf(`{
-			"status": "ok",
-			"redis": %q,
-			"environment": %q,
-			"timestamp": %q
-		}`,
-			redisHealth,
-			envStatus,
-			time.Now().Format(time.RFC3339))
-		w.Write([]byte(response))
-	})))
-
-	// Update handler
-	mux.HandleFunc("/api/update", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is a Vercel cron job or an authenticated request
-		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
-		hasValidToken := r.Header.Get("X-Update-Key") == os.Getenv(envKeyRedisToken)
-		
-		if !isVercelCron && !hasValidToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		papers, err := scrapePapers()
-		if err != nil {
-			log.Printf("Error scraping papers: %v", err)
-			http.Error(w, fmt.Sprintf("Error scraping papers: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		feed, err := generateRSS(papers)
-		if err != nil {
-			log.Printf("Error generating RSS: %v", err)
-			http.Error(w, fmt.Sprintf("Error generating RSS: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		var cacheError string
-		if redisConnected {
-			err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
-			if err != nil {
-				cacheError = err.Error()
-				log.Printf("Error caching feed: %v", err)
-			} else {
-				err = rdb.Set(ctx, "last_update", time.Now(), 0).Err()
-				if err != nil {
-					log.Printf("Error updating last_update time: %v", err)
-				}
-			}
-		} else {
-			cacheError = "Redis not connected"
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		response := fmt.Sprintf(`{
-			"status": "updated",
-			"cache_updated": %v,
-			"cache_error": %q,
-			"papers_count": %d
-		}`,
-			cacheError == "",
-			cacheError,
-			len(papers))
-		w.Write([]byte(response))
-	})))
-}
-
-// Add cleanup function
-func cleanup() {
-	if rdb != nil {
-		if err := rdb.Close(); err != nil {
-			log.Printf("[ERROR] Failed to close Redis connection: %v", err)
-		}
-	}
-}
-
-// Handler handles all requests routed by Vercel
+// Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[DEBUG] Received request for path: %s", r.URL.Path)
-	
-	// Initialize if not already initialized
-	if mux == nil {
-		initialize()
+	// Initialize Redis on first request
+	if !redisConnected {
+		initRedis()
 	}
 
-	// Just serve the request, no path manipulation needed
-	mux.ServeHTTP(w, r)
+	// Remove trailing slash and normalize path
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	if path == "" {
+		path = "/api"  // Normalize empty path to /api
+	}
+
+	// Apply CORS middleware
+	corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		switch path {
+		case "/api":
+			// Health check endpoint
+			w.Header().Set("Content-Type", "application/json")
+			healthStatus := map[string]interface{}{
+				"status":       "ok",
+				"endpoints":    []string{"/api/feed"},
+				"cache_status": redisConnected,
+				"timestamp":    time.Now().UTC().Format(time.RFC3339),
+				"version":      "1.0.0",
+			}
+			
+			if err := json.NewEncoder(w).Encode(healthStatus); err != nil {
+				http.Error(w, "Error encoding response", http.StatusInternalServerError)
+			}
+			return
+
+		case "/api/feed":
+			feed, err := getCachedFeed()
+			if err != nil {
+				http.Error(w, "Error generating feed", http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/rss+xml")
+			w.Write(feed)
+			return
+
+		default:
+			http.NotFound(w, r)
+		}
+	})(w, r)
 }
