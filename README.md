@@ -66,7 +66,31 @@ The local server will be available at `http://localhost:3000`
 
 - `/api` - Health check and status
 - `/api/feed` - RSS feed of papers
-- `/api/update` - Manually trigger feed update (requires authentication)
+- `/api/update-cache` - Manually trigger feed update (requires authentication)
+
+## Manual Cache Updates
+
+To enable secure manual cache updates, you need to set an `UPDATE_KEY` environment variable:
+
+1. Add to your Vercel environment variables:
+```env
+UPDATE_KEY=your_secret_key_here  # Use a secure random string
+```
+
+2. To manually trigger a cache update, use the following curl command:
+```bash
+curl -X GET \
+  https://your-project.vercel.app/api/update-cache \
+  -H 'X-Update-Key: your_secret_key_here'
+```
+
+Successful response:
+```json
+{
+  "status": "Cache updated successfully",
+  "timestamp": "2024-03-20T15:30:45Z"
+}
+```
 
 ## Example Response
 
