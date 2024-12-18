@@ -265,6 +265,26 @@ func generateFeedDirect() ([]byte, error) {
 	return generateRSS(papers)
 }
 
+func updateCache() error {
+	if !redisConnected {
+		return fmt.Errorf("redis not connected")
+	}
+
+	// Generate new feed
+	feed, err := generateFeedDirect()
+	if err != nil {
+		return fmt.Errorf("failed to generate feed: %w", err)
+	}
+
+	// Update cache
+	err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+	if err != nil {
+		return fmt.Errorf("failed to update cache: %w", err)
+	}
+
+	return nil
+}
+
 // Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// Initialize Redis on first request
@@ -306,6 +326,29 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 			w.Header().Set("Content-Type", "application/rss+xml")
 			w.Write(feed)
+			return
+
+		case "/api/update-cache":
+			// Check for secret key to prevent unauthorized updates
+			secretKey := r.Header.Get("X-Update-Key")
+			expectedKey := os.Getenv("UPDATE_KEY")
+			
+			if expectedKey == "" || secretKey != expectedKey {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			err := updateCache()
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error updating cache: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "Cache updated successfully",
+				"timestamp": time.Now().UTC().Format(time.RFC3339),
+			})
 			return
 
 		default:
