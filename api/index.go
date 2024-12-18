@@ -30,8 +30,9 @@ type Paper struct {
 }
 
 type RSS struct {
-	Version string `xml:"version"`
-	Channel Channel `xml:"channel"`
+	XMLName xml.Name `xml:"rss"`
+	Version string   `xml:"version,attr"`
+	Channel Channel  `xml:"channel"`
 }
 
 type Channel struct {
@@ -181,18 +182,24 @@ func generateRSS(papers []Paper) ([]byte, error) {
 	}
 
 	rss := RSS{
-    Version: "2.0",
-    Channel: Channel{
-        Title:         "宝の知識: Hugging Face 論文フィード", // "Takara no Chishiki: Hugging Face Ronbun Fiido"
-        Link:          baseURL,
-        Description:   "最先端のAI論文をお届けする、Takara.aiの厳選フィード", // "Delivering cutting-edge AI papers, curated by Takara.ai."
-        LastBuildDate: time.Now().UTC().Format(time.RFC1123Z),
-        Items:         items,
-    },
-}
+		Version: "2.0",
+		Channel: Channel{
+			Title:         "宝の知識: Hugging Face 論文フィード",
+			Link:          baseURL,
+			Description:   "最先端のAI論文をお届けする、Takara.aiの厳選フィード",
+			LastBuildDate: time.Now().UTC().Format(time.RFC1123Z),
+			Items:         items,
+		},
+	}
 
-
-	return xml.MarshalIndent(rss, "", "  ")
+	// Add XML header and proper encoding
+	output, err := xml.MarshalIndent(rss, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	
+	// Prepend the XML header
+	return append([]byte(xml.Header), output...), nil
 }
 
 // Simple CORS middleware
