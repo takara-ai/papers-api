@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
-	"golang.org/x/net/html"
-	"os"
+
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/net/html"
 )
 
 const (
