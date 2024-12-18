@@ -181,15 +181,16 @@ func generateRSS(papers []Paper) ([]byte, error) {
 	}
 
 	rss := RSS{
-		Version: "2.0",
-		Channel: Channel{
-			Title:         "Hugging Face Papers RSS Feed",
-			Link:          baseURL,
-			Description:   "Latest papers from Hugging Face",
-			LastBuildDate: time.Now().UTC().Format(time.RFC1123Z),
-			Items:         items,
-		},
-	}
+    Version: "2.0",
+    Channel: Channel{
+        Title:         "宝の知識: Hugging Face 論文フィード", // "Takara no Chishiki: Hugging Face Ronbun Fiido"
+        Link:          baseURL,
+        Description:   "最先端のAI論文をお届けする、Takara.aiの厳選フィード", // "Delivering cutting-edge AI papers, curated by Takara.ai."
+        LastBuildDate: time.Now().UTC().Format(time.RFC1123Z),
+        Items:         items,
+    },
+}
+
 
 	return xml.MarshalIndent(rss, "", "  ")
 }
