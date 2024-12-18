@@ -435,8 +435,28 @@ func initialize() {
 	// Initialize router
 	mux = http.NewServeMux()
 
-	// Register routes
-	mux.HandleFunc("/feed", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Root handler for API info
+	mux.HandleFunc("/api", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		response := `{
+			"status": "ok",
+			"available_endpoints": [
+				"/api/feed",
+				"/api/status",
+				"/api/health",
+				"/api/update"
+			],
+			"documentation": "https://github.com/yourusername/hf-daily-papers-feeds"
+		}`
+		w.Write([]byte(response))
+	})))
+
+	// Feed handler
+	mux.HandleFunc("/api/feed", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		feed, err := getCachedFeed()
 		if err != nil {
 			log.Printf("Error getting feed: %v", err)
@@ -448,7 +468,8 @@ func initialize() {
 		w.Write(feed)
 	})))
 
-	mux.HandleFunc("/status", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Status handler
+	mux.HandleFunc("/api/status", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		var lastUpdate time.Time
 		var redisError string
 
@@ -483,63 +504,8 @@ func initialize() {
 		w.Write([]byte(response))
 	})))
 
-	mux.HandleFunc("/update", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is a Vercel cron job or an authenticated request
-		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
-		hasValidToken := r.Header.Get("X-Update-Key") == os.Getenv(envKeyRedisToken)
-		
-		if !isVercelCron && !hasValidToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		papers, err := scrapePapers()
-		if err != nil {
-			log.Printf("Error scraping papers: %v", err)
-			http.Error(w, fmt.Sprintf("Error scraping papers: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		feed, err := generateRSS(papers)
-		if err != nil {
-			log.Printf("Error generating RSS: %v", err)
-			http.Error(w, fmt.Sprintf("Error generating RSS: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		var cacheError string
-		// Only try to cache if Redis is connected
-		if redisConnected {
-			err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
-			if err != nil {
-				cacheError = err.Error()
-				log.Printf("Error caching feed: %v", err)
-			} else {
-				// Update last update time only if cache update succeeded
-				err = rdb.Set(ctx, "last_update", time.Now(), 0).Err()
-				if err != nil {
-					log.Printf("Error updating last_update time: %v", err)
-				}
-			}
-		} else {
-			cacheError = "Redis not connected"
-		}
-
-		// Return success with cache status
-		w.Header().Set("Content-Type", "application/json")
-		response := fmt.Sprintf(`{
-			"status": "updated",
-			"cache_updated": %v,
-			"cache_error": %q,
-			"papers_count": %d
-		}`,
-			cacheError == "",
-			cacheError,
-			len(papers))
-		w.Write([]byte(response))
-	})))
-
-	mux.HandleFunc("/health", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Health handler
+	mux.HandleFunc("/api/health", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		
 		var redisHealth string
@@ -571,6 +537,60 @@ func initialize() {
 			time.Now().Format(time.RFC3339))
 		w.Write([]byte(response))
 	})))
+
+	// Update handler
+	mux.HandleFunc("/api/update", corsMiddleware(LoggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		// Check if this is a Vercel cron job or an authenticated request
+		isVercelCron := r.Header.Get("User-Agent") == "vercel-cron"
+		hasValidToken := r.Header.Get("X-Update-Key") == os.Getenv(envKeyRedisToken)
+		
+		if !isVercelCron && !hasValidToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		papers, err := scrapePapers()
+		if err != nil {
+			log.Printf("Error scraping papers: %v", err)
+			http.Error(w, fmt.Sprintf("Error scraping papers: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		feed, err := generateRSS(papers)
+		if err != nil {
+			log.Printf("Error generating RSS: %v", err)
+			http.Error(w, fmt.Sprintf("Error generating RSS: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		var cacheError string
+		if redisConnected {
+			err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+			if err != nil {
+				cacheError = err.Error()
+				log.Printf("Error caching feed: %v", err)
+			} else {
+				err = rdb.Set(ctx, "last_update", time.Now(), 0).Err()
+				if err != nil {
+					log.Printf("Error updating last_update time: %v", err)
+				}
+			}
+		} else {
+			cacheError = "Redis not connected"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		response := fmt.Sprintf(`{
+			"status": "updated",
+			"cache_updated": %v,
+			"cache_error": %q,
+			"papers_count": %d
+		}`,
+			cacheError == "",
+			cacheError,
+			len(papers))
+		w.Write([]byte(response))
+	})))
 }
 
 // Add cleanup function
@@ -582,12 +602,15 @@ func cleanup() {
 	}
 }
 
-// Handler handles requests to /api/main
+// Handler handles all requests routed by Vercel
 func Handler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[DEBUG] Received request for path: %s", r.URL.Path)
+	
 	// Initialize if not already initialized
 	if mux == nil {
 		initialize()
 	}
+
+	// Just serve the request, no path manipulation needed
 	mux.ServeHTTP(w, r)
 }
