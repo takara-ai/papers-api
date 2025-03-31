@@ -1,7 +1,9 @@
 {
-  "builds": [
-    { "src": "api/*.go", "use": "@vercel/go" }
-  ],
+  "functions": {
+    "api/*.go": {
+      "maxDuration": 60
+    }
+  },
   "routes": [
     { "src": "/api$", "dest": "/api" },
     { "src": "/api/(.*)", "dest": "/api" }
@@ -12,4 +14,4 @@
       "schedule": "0 0 * * *"
     }
   ]
-} 
+}
