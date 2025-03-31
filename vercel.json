@@ -1,7 +1,5 @@
 {
-  "builds": [
-    { "src": "api/*.go", "use": "@vercel/go" }
-  ],
+  "builds": [{ "src": "api/*.go", "use": "@vercel/go" }],
   "routes": [
     { "src": "/api$", "dest": "/api" },
     { "src": "/api/(.*)", "dest": "/api" }
@@ -11,5 +9,10 @@
       "path": "/api/update-cache",
       "schedule": "0 0 * * *"
     }
-  ]
-} 
+  ],
+  "functions": {
+    "api/*.go": {
+      "maxDuration": 60
+    }
+  }
+}
