@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -127,22 +128,31 @@ func scrapeAbstract(url string) (string, error) {
 	
 	resp, err := client.Get(url)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch abstract: %w", err)
+		return "", fmt.Errorf("failed to fetch abstract from %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to fetch abstract from %s: status code %d", url, resp.StatusCode)
+	}
+	
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to parse HTML from %s: %w", url, err)
 	}
 
 	var abstract string
+	var found bool
 	var crawler func(*html.Node)
 	crawler = func(node *html.Node) {
+		if found { // Optimization: stop crawling once found
+			return
+		}
 		if node.Type == html.ElementNode && node.Data == "div" {
 			for _, attr := range node.Attr {
 				if attr.Key == "class" && strings.Contains(attr.Val, "pb-8 pr-4 md:pr-16") {
 					abstract = extractText(node)
+					found = true
 					return
 				}
 			}
@@ -153,6 +163,10 @@ func scrapeAbstract(url string) (string, error) {
 	}
 	crawler(doc)
 
+	if !found {
+		log.Printf("[WARN] Abstract div with class 'pb-8 pr-4 md:pr-16' not found on page: %s", url)
+	}
+	
 	abstract = strings.TrimPrefix(abstract, "Abstract")
 	abstract = strings.ReplaceAll(abstract, "\n", " ")
 	return strings.TrimSpace(abstract), nil
@@ -176,16 +190,21 @@ func scrapePapers() ([]Paper, error) {
 	
 	resp, err := client.Get(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch papers: %w", err)
+		return nil, fmt.Errorf("failed to fetch papers from %s: %w", baseURL, err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch papers from %s: status code %d", baseURL, resp.StatusCode)
+	}
+	
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse HTML from %s: %w", baseURL, err)
 	}
 
 	var papers []Paper
+
 	var crawler func(*html.Node)
 	crawler = func(node *html.Node) {
 		if node.Type == html.ElementNode && node.Data == "h3" {
@@ -207,7 +226,7 @@ func scrapePapers() ([]Paper, error) {
 				abstract, err := scrapeAbstract(url)
 				if err != nil {
 					log.Printf("Failed to extract abstract for %s: %v", url, err)
-					abstract = ""
+					abstract = "[Abstract not available]" // Placeholder
 				}
 
 				papers = append(papers, Paper{
@@ -302,8 +321,9 @@ func initRedis() {
 	}
 
 	rdb = redis.NewClient(opt)
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Printf("[ERROR] Error connecting to Redis: %v", err)
+	pingErr := rdb.Ping(ctx).Err()
+	if pingErr != nil {
+		log.Printf("[ERROR] Error connecting to Redis: %v", pingErr)
 		return
 	}
 
@@ -346,13 +366,13 @@ func generateFeedDirect(requestURL string) ([]byte, error) {
 
 func updateCache() error {
 	if !redisConnected {
-		return fmt.Errorf("redis not connected")
+		return fmt.Errorf("redis not connected, cannot update cache")
 	}
 
 	// Generate new feed
 	feed, err := generateFeedDirect(baseURL)
 	if err != nil {
-		return fmt.Errorf("failed to generate feed: %w", err)
+		return fmt.Errorf("failed to generate feed for cache update: %w", err)
 	}
 
 	// Update feed cache
@@ -363,8 +383,10 @@ func updateCache() error {
 
 	// Invalidate summary cache since it depends on feed content
 	err = rdb.Del(ctx, summaryCacheKey).Err()
-	if err != nil {
-		log.Printf("[WARN] Failed to invalidate summary cache: %v", err)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		log.Printf("[WARN] Failed to invalidate summary cache key %s: %v", summaryCacheKey, err)
+	} else {
+		log.Printf("[INFO] Successfully invalidated summary cache key %s", summaryCacheKey)
 	}
 
 	return nil
@@ -374,7 +396,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 	var rss RSS
 	err := xml.Unmarshal([]byte(xmlContent), &rss)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to unmarshal RSS XML: %w", err)
 	}
 
 	// Format date
@@ -459,12 +481,12 @@ Below are the paper abstracts and information in markdown format:
 
 	requestBody, err := json.Marshal(request)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to marshal LLM request: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(requestBody))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create LLM request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -473,22 +495,23 @@ Below are the paper abstracts and information in markdown format:
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to send request to Hugging Face Router API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP error from Hugging Face Router API: %d, %s", resp.StatusCode, string(bodyBytes))
+		return "", fmt.Errorf("HTTP error %d from Hugging Face Router API: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var llmResp LLMResponse
 	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decode LLM response: %w", err)
 	}
 
-	if len(llmResp.Choices) == 0 {
-		return "", fmt.Errorf("no response choices returned from Hugging Face Router API")
+	if len(llmResp.Choices) == 0 || llmResp.Choices[0].Message.Content == "" {
+		log.Printf("[WARN] LLM response contained no choices or empty content. Response: %+v", llmResp)
+		return "", fmt.Errorf("no valid response content returned from Hugging Face Router API")
 	}
 
 	response := llmResp.Choices[0].Message.Content
@@ -541,7 +564,7 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 	// Add XML header and proper encoding
 	output, err := xml.MarshalIndent(rss, "", "  ")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal summary RSS: %w", err)
 	}
 	
 	// Prepend the XML header
@@ -564,7 +587,7 @@ func getCachedSummary(requestURL string) ([]byte, error) {
 	log.Printf("[INFO] Summary cache miss, generating new summary")
 	summary, err := generateSummaryDirect(requestURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate summary: %w", err)
+		return nil, fmt.Errorf("failed to generate summary directly after cache miss: %w", err)
 	}
 
 	// Cache the new summary
@@ -584,19 +607,19 @@ func generateSummaryDirect(requestURL string) ([]byte, error) {
 	// Get the feed content
 	feed, err := getCachedFeed(requestURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get feed: %w", err)
+		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
 	
 	// Convert feed to markdown
 	markdown, err := parseRSSToMarkdown(string(feed))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse RSS to markdown: %w", err)
+		return nil, fmt.Errorf("failed to parse RSS to markdown for summary generation: %w", err)
 	}
 	
 	// Summarize with LLM
 	summary, err := summarizeWithLLM(markdown)
 	if err != nil {
-		return nil, fmt.Errorf("failed to summarize with LLM: %w", err)
+		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
 	
 	return generateSummaryRSS(summary, requestURL)
@@ -612,7 +635,7 @@ func updateSummaryCache() error {
 	// Generate new summary
 	summary, err := generateSummaryDirect(baseURL)
 	if err != nil {
-		return fmt.Errorf("failed to generate summary: %w", err)
+		return fmt.Errorf("failed to generate summary for cache update: %w", err)
 	}
 
 	// Update cache
@@ -663,6 +686,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		case "/api/feed":
 			feed, err := getCachedFeed(requestURL)
 			if err != nil {
+				log.Printf("[ERROR] Failed to get cached feed: %v", err)
 				http.Error(w, "Error generating feed", http.StatusInternalServerError)
 				return
 			}
@@ -674,6 +698,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		case "/api/summary":
 			summary, err := getCachedSummary(requestURL)
 			if err != nil {
+				log.Printf("[ERROR] Failed to get cached summary: %v", err)
 				http.Error(w, fmt.Sprintf("Error generating summary: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -694,6 +719,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 			err := updateCache()
 			if err != nil {
+				log.Printf("[ERROR] Failed to update feed cache via API: %v", err)
 				http.Error(w, fmt.Sprintf("Error updating cache: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -701,6 +727,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			// Also update the summary cache
 			err = updateSummaryCache()
 			if err != nil {
+				log.Printf("[ERROR] Failed to update summary cache via API: %v", err)
 				http.Error(w, fmt.Sprintf("Error updating summary cache: %v", err), http.StatusInternalServerError)
 				return
 			}
