@@ -96,7 +96,7 @@ type Message struct {
 type LLMResponse struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
-	Created int64  `json:"created"`
+	Created float64 `json:"created"`
 	Model   string `json:"model"`
 	Choices []struct {
 		Index   int `json:"index"`
@@ -409,7 +409,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 
 // summarizeWithLLM summarizes the markdown content using Hugging Face Router API
 func summarizeWithLLM(markdownContent string) (string, error) {
-	apiURL := "https://router.huggingface.co/novita/v3/openai/chat/completions"
+	apiURL := "https://router.huggingface.co/sambanova/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
 	
 	if apiKey == "" {
@@ -429,13 +429,16 @@ Format the output in HTML:
   <li>Include key metrics and outcomes</li>
   <li>Keep the tone light and engaging</li>
 </ul>
-<p>Keep it under 200 words. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.</p>
+
+Keep it under 200 words. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.
+
+Do not enclose the HTML in a markdown code block, just return the HTML.
 
 Below are the paper abstracts and information in markdown format:
 ` + markdownContent
 
 	request := LLMRequest{
-		Model: "deepseek/deepseek-r1-turbo",
+		Model: "Qwen2.5-72B-Instruct",
 		Messages: []Message{
 			{
 				Role:    "user",
