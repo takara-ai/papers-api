@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -21,6 +22,7 @@ import (
 const (
 	baseURL       = "https://huggingface.co/papers"
 	scrapeTimeout = 30 * time.Second
+	llmTimeout    = 90 * time.Second
 	maxPapers     = 50
 	cacheKey      = "hf_papers_cache"
 	summaryCacheKey = "hf_papers_summary_cache"
@@ -119,15 +121,24 @@ var (
 	rdb *redis.Client
 	ctx = context.Background()
 	redisConnected bool
+	initOnce sync.Once
 )
 
-func scrapeAbstract(url string) (string, error) {
+func scrapeAbstract(ctx context.Context, url string) (string, error) {
 	client := &http.Client{
 		Timeout: scrapeTimeout,
 	}
 	
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
+		return "", fmt.Errorf("failed to create request for %s: %w", url, err)
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", fmt.Errorf("timeout fetching abstract from %s: %w", url, err)
+		}
 		return "", fmt.Errorf("failed to fetch abstract from %s: %w", url, err)
 	}
 	defer resp.Body.Close()
@@ -183,13 +194,21 @@ func extractText(n *html.Node) string {
 	return text
 }
 
-func scrapePapers() ([]Paper, error) {
+func scrapePapers(ctx context.Context) ([]Paper, error) {
 	client := &http.Client{
 		Timeout: scrapeTimeout,
 	}
 	
-	resp, err := client.Get(baseURL)
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil)
 	if err != nil {
+		return nil, fmt.Errorf("failed to create request for %s: %w", baseURL, err)
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("timeout fetching papers from %s: %w", baseURL, err)
+		}
 		return nil, fmt.Errorf("failed to fetch papers from %s: %w", baseURL, err)
 	}
 	defer resp.Body.Close()
@@ -223,7 +242,7 @@ func scrapePapers() ([]Paper, error) {
 			
 			if href != "" {
 				url := fmt.Sprintf("https://huggingface.co%s", href)
-				abstract, err := scrapeAbstract(url)
+				abstract, err := scrapeAbstract(ctx, url)
 				if err != nil {
 					log.Printf("Failed to extract abstract for %s: %v", url, err)
 					abstract = "[Abstract not available]" // Placeholder
@@ -331,58 +350,67 @@ func initRedis() {
 	log.Printf("[INFO] Successfully connected to Redis")
 }
 
-func getCachedFeed(requestURL string) ([]byte, error) {
+func getCachedFeed(ctx context.Context, requestURL string) ([]byte, error) {
 	if !redisConnected {
-		return generateFeedDirect(requestURL)
+		return generateFeedDirect(ctx, requestURL)
 	}
 
 	// Try to get from cache first
 	cachedData, err := rdb.Get(ctx, cacheKey).Bytes()
 	if err == nil {
 		return cachedData, nil
+	} else if !errors.Is(err, redis.Nil) {
+		// Log unexpected Redis errors but try generating directly as fallback
+		log.Printf("[WARN] Redis Get failed for key %s: %v. Generating feed directly.", cacheKey, err)
 	}
 
-	// Cache miss, generate new feed
-	feed, err := generateFeedDirect(requestURL)
+	// Cache miss or Redis error, generate new feed
+	feed, err := generateFeedDirect(ctx, requestURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate direct feed: %w", err)
 	}
 
-	// Cache the new feed
+	// Cache the new feed if Redis is connected
 	if redisConnected {
-		rdb.Set(ctx, cacheKey, feed, cacheDuration)
+		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+		if err != nil {
+			// Log caching errors but don't fail the request, as we have the feed
+			log.Printf("[WARN] Failed to cache feed for key %s: %v", cacheKey, err)
+		}
 	}
 
 	return feed, nil
 }
 
-func generateFeedDirect(requestURL string) ([]byte, error) {
-	papers, err := scrapePapers()
+func generateFeedDirect(ctx context.Context, requestURL string) ([]byte, error) {
+	// Pass context to scrapePapers
+	papers, err := scrapePapers(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed scraping papers: %w", err)
 	}
 	return generateRSS(papers, requestURL)
 }
 
-func updateCache() error {
+func updateCache(ctx context.Context) error {
 	if !redisConnected {
 		return fmt.Errorf("redis not connected, cannot update cache")
 	}
 
-	// Generate new feed
-	feed, err := generateFeedDirect(baseURL)
+	// Generate new feed, passing context
+	feed, err := generateFeedDirect(ctx, baseURL) // Use baseURL for the canonical cache content
 	if err != nil {
 		return fmt.Errorf("failed to generate feed for cache update: %w", err)
 	}
 
-	// Update feed cache
+	// Update feed cache, passing context
 	err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
 	if err != nil {
 		return fmt.Errorf("failed to update feed cache: %w", err)
 	}
 
-	// Invalidate summary cache since it depends on feed content
+	// Invalidate summary cache since it depends on feed content, passing context
 	err = rdb.Del(ctx, summaryCacheKey).Err()
+	// Log but don't return error on Del failure, as main cache update succeeded
 	if err != nil && !errors.Is(err, redis.Nil) {
 		log.Printf("[WARN] Failed to invalidate summary cache key %s: %v", summaryCacheKey, err)
 	} else {
@@ -430,7 +458,8 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 }
 
 // summarizeWithLLM summarizes the markdown content using Hugging Face Router API
-func summarizeWithLLM(markdownContent string) (string, error) {
+// It now accepts a context for cancellation and timeout, and uses an HTTP client with a timeout.
+func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
 	apiURL := "https://router.huggingface.co/sambanova/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
 	
@@ -484,7 +513,8 @@ Below are the paper abstracts and information in markdown format:
 		return "", fmt.Errorf("failed to marshal LLM request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(requestBody))
+	// Create request with context
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create LLM request: %w", err)
 	}
@@ -492,9 +522,15 @@ Below are the paper abstracts and information in markdown format:
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{}
+	// Create an HTTP client with the LLM timeout
+	client := &http.Client{
+		Timeout: llmTimeout,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", fmt.Errorf("timeout calling Hugging Face Router API: %w", err)
+		}
 		return "", fmt.Errorf("failed to send request to Hugging Face Router API: %w", err)
 	}
 	defer resp.Body.Close()
@@ -571,30 +607,36 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 	return append([]byte(xml.Header), output...), nil
 }
 
-func getCachedSummary(requestURL string) ([]byte, error) {
+// getCachedSummary retrieves the summary from cache or generates it if missed.
+// It now accepts a context for Redis operations and summary generation.
+func getCachedSummary(ctx context.Context, requestURL string) ([]byte, error) {
 	if !redisConnected {
 		log.Printf("[WARN] Redis not connected, generating summary directly")
-		return generateSummaryDirect(requestURL)
+		return generateSummaryDirect(ctx, requestURL)
 	}
 
 	// Try to get from cache first
 	cachedData, err := rdb.Get(ctx, summaryCacheKey).Bytes()
 	if err == nil {
 		return cachedData, nil
+	} else if !errors.Is(err, redis.Nil) {
+		// Log unexpected Redis errors but try generating directly as fallback
+		log.Printf("[WARN] Redis Get failed for key %s: %v. Generating summary directly.", summaryCacheKey, err)
 	}
 
-	// Cache miss, generate new summary
+	// Cache miss or Redis error, generate new summary
 	log.Printf("[INFO] Summary cache miss, generating new summary")
-	summary, err := generateSummaryDirect(requestURL)
+	summary, err := generateSummaryDirect(ctx, requestURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate summary directly after cache miss: %w", err)
 	}
 
-	// Cache the new summary
+	// Cache the new summary if Redis is connected
 	if redisConnected {
 		err = rdb.Set(ctx, summaryCacheKey, summary, cacheDuration).Err()
 		if err != nil {
-			log.Printf("[WARN] Failed to cache summary: %v", err)
+			// Log caching errors but don't fail the request
+			log.Printf("[WARN] Failed to cache summary for key %s: %v", summaryCacheKey, err)
 		} else {
 			log.Printf("[INFO] Successfully cached new summary")
 		}
@@ -603,21 +645,23 @@ func getCachedSummary(requestURL string) ([]byte, error) {
 	return summary, nil
 }
 
-func generateSummaryDirect(requestURL string) ([]byte, error) {
-	// Get the feed content
-	feed, err := getCachedFeed(requestURL)
+// generateSummaryDirect generates the summary by getting feed, parsing, and calling LLM.
+// It now accepts a context to pass down the call chain.
+func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, error) {
+	// Get the feed content, passing context
+	feed, err := getCachedFeed(ctx, requestURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
 	
-	// Convert feed to markdown
+	// Convert feed to markdown (no context needed for this part)
 	markdown, err := parseRSSToMarkdown(string(feed))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RSS to markdown for summary generation: %w", err)
 	}
 	
-	// Summarize with LLM
-	summary, err := summarizeWithLLM(markdown)
+	// Summarize with LLM, passing context
+	summary, err := summarizeWithLLM(ctx, markdown)
 	if err != nil {
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
@@ -625,20 +669,22 @@ func generateSummaryDirect(requestURL string) ([]byte, error) {
 	return generateSummaryRSS(summary, requestURL)
 }
 
-func updateSummaryCache() error {
+// updateSummaryCache forces a refresh of the summary cache.
+// It now accepts a context for Redis operations and summary generation.
+func updateSummaryCache(ctx context.Context) error {
 	if !redisConnected {
-		return fmt.Errorf("redis not connected")
+		return fmt.Errorf("redis not connected, cannot update summary cache")
 	}
 
 	log.Printf("[INFO] Updating summary cache")
 	
-	// Generate new summary
-	summary, err := generateSummaryDirect(baseURL)
+	// Generate new summary, passing context
+	summary, err := generateSummaryDirect(ctx, baseURL) // Use baseURL for the canonical cache content
 	if err != nil {
 		return fmt.Errorf("failed to generate summary for cache update: %w", err)
 	}
 
-	// Update cache
+	// Update cache, passing context
 	err = rdb.Set(ctx, summaryCacheKey, summary, cacheDuration).Err()
 	if err != nil {
 		return fmt.Errorf("failed to update summary cache: %w", err)
@@ -650,10 +696,13 @@ func updateSummaryCache() error {
 
 // Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Initialize Redis on first request
-	if !redisConnected {
+	// Initialize Redis on first request (using background context for initialization)
+	initOnce.Do(func() {
 		initRedis()
-	}
+	})
+
+	// Get the request context
+	reqCtx := r.Context()
 
 	// Remove trailing slash and normalize path
 	path := strings.TrimSuffix(r.URL.Path, "/")
@@ -684,7 +733,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 
 		case "/api/feed":
-			feed, err := getCachedFeed(requestURL)
+			// Pass request context to feed retrieval/generation
+			feed, err := getCachedFeed(reqCtx, requestURL)
 			if err != nil {
 				log.Printf("[ERROR] Failed to get cached feed: %v", err)
 				http.Error(w, "Error generating feed", http.StatusInternalServerError)
@@ -696,7 +746,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 			
 		case "/api/summary":
-			summary, err := getCachedSummary(requestURL)
+			// Pass request context to summary retrieval/generation
+			summary, err := getCachedSummary(reqCtx, requestURL)
 			if err != nil {
 				log.Printf("[ERROR] Failed to get cached summary: %v", err)
 				http.Error(w, fmt.Sprintf("Error generating summary: %v", err), http.StatusInternalServerError)
@@ -717,15 +768,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			err := updateCache()
+			// Use request context for the update process. 
+			// Consider background context if updates are long-running & shouldn't be tied to client connection.
+			err := updateCache(reqCtx) 
 			if err != nil {
 				log.Printf("[ERROR] Failed to update feed cache via API: %v", err)
 				http.Error(w, fmt.Sprintf("Error updating cache: %v", err), http.StatusInternalServerError)
 				return
 			}
 			
-			// Also update the summary cache
-			err = updateSummaryCache()
+			// Also update the summary cache, passing context
+			err = updateSummaryCache(reqCtx)
 			if err != nil {
 				log.Printf("[ERROR] Failed to update summary cache via API: %v", err)
 				http.Error(w, fmt.Sprintf("Error updating summary cache: %v", err), http.StatusInternalServerError)
