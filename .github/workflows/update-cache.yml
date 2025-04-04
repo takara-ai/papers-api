@@ -1,0 +1,13 @@
+name: Update Cache
+on:
+  schedule:
+    - cron: "0 0 * * *" # Daily at 00:00 UTC
+
+jobs:
+  update-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger cache update
+        run: |
+          curl -X GET "https://papers.takara.ai/api/update-cache" \
+            -H "X-Update-Key: ${{ secrets.UPDATE_KEY }}" --fail
