@@ -7,11 +7,5 @@
   "routes": [
     { "src": "/api$", "dest": "/api" },
     { "src": "/api/(.*)", "dest": "/api" }
-  ],
-  "crons": [
-    {
-      "path": "/api/update-cache",
-      "schedule": "0 0 * * *"
-    }
   ]
 }
