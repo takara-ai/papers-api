@@ -584,9 +584,9 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 		Version: "2.0",
 		XMLNS:   "http://www.w3.org/2005/Atom",
 		Channel: Channel{
-			Title:         "宝の知識: Hugging Face 論文サマリー",
+			Title:         "Takara TLDR",
 			Link:          baseURL,
-			Description:   "最先端のAI論文の要約をお届けする、Takara.aiの厳選フィード",
+			Description:   "Daily summaries of AI research papers from takara.ai",
 			LastBuildDate: now.Format(time.RFC1123Z),
 			AtomLink: AtomLink{
 				Href: requestURL,
