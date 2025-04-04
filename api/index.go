@@ -21,6 +21,7 @@ import (
 
 const (
 	baseURL       = "https://huggingface.co/papers"
+	liveURL       = "https://tldr.takara.ai"
 	scrapeTimeout = 30 * time.Second
 	llmTimeout    = 90 * time.Second
 	maxPapers     = 50
@@ -569,7 +570,7 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 	
 	item := Item{
 		Title:       "AI Research Papers Summary for " + now.Format("January 2, 2006"),
-		Link:        baseURL,
+		Link:        liveURL,
 		Description: CDATA{Text: summary},
 		PubDate:     now.Format(time.RFC1123Z),
 		GUID: GUID{
@@ -583,7 +584,7 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 		XMLNS:   "http://www.w3.org/2005/Atom",
 		Channel: Channel{
 			Title:         "Takara TLDR",
-			Link:          baseURL,
+			Link:          liveURL,
 			Description:   "Daily summaries of AI research papers from takara.ai",
 			LastBuildDate: now.Format(time.RFC1123Z),
 			AtomLink: AtomLink{
