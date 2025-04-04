@@ -391,31 +391,78 @@ func generateFeedDirect(ctx context.Context, requestURL string) ([]byte, error) 
 	return generateRSS(papers, requestURL)
 }
 
-func updateCache(ctx context.Context) error {
+// updateAllCaches generates fresh feed and summary data and updates both caches.
+func updateAllCaches(ctx context.Context) error {
 	if !redisConnected {
-		return fmt.Errorf("redis not connected, cannot update cache")
+		return fmt.Errorf("redis not connected, cannot update caches")
 	}
 
-	// Generate new feed, passing context
-	feed, err := generateFeedDirect(ctx, baseURL) // Use baseURL for the canonical cache content
+	logger.Info("Starting cache update for feed and summary")
+
+	// 1. Generate fresh feed data
+	// Use baseURL for the canonical cache content's requestURL in generateRSS
+	freshFeedBytes, err := generateFeedDirect(ctx, baseURL)
 	if err != nil {
-		return fmt.Errorf("failed to generate feed for cache update: %w", err)
+		return fmt.Errorf("failed to generate direct feed for cache update: %w", err)
 	}
 
-	// Update feed cache, passing context
-	err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
+	// 2. Update feed cache
+	// Use a separate context for Redis operations if needed, but reqCtx is usually fine
+	// Adding a small timeout specifically for Redis Set might be wise.
+	err = rdb.Set(ctx, cacheKey, freshFeedBytes, cacheDuration).Err()
 	if err != nil {
-		return fmt.Errorf("failed to update feed cache: %w", err)
-	}
-
-	// Invalidate summary cache since it depends on feed content, passing context
-	err = rdb.Del(ctx, summaryCacheKey).Err()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		logger.Warn("Failed to invalidate summary cache key", "key", summaryCacheKey, "error", err)
+		// Log the error but continue to attempt summary update if possible
+		logger.Error("Failed to update feed cache", "key", cacheKey, "error", err)
+		// Decide if this error should prevent summary update (e.g., return err here)
+		// For now, we log and continue.
 	} else {
-		logger.Info("Successfully invalidated summary cache key", "key", summaryCacheKey)
+		logger.Info("Successfully updated feed cache", "key", cacheKey)
 	}
 
+
+	// --- Summary Update ---
+
+	// 3. Parse the *fresh* feed bytes to markdown
+	markdown, err := parseRSSToMarkdown(string(freshFeedBytes))
+	if err != nil {
+		// If parsing fails, we cannot generate a summary. Log and return error.
+		logger.Error("Failed to parse fresh feed to markdown for summary update", "error", err)
+		return fmt.Errorf("failed to parse fresh feed to markdown: %w", err)
+	}
+
+	// 4. Summarize markdown with LLM
+	// Use a context with appropriate timeout for the LLM call
+	summaryCtx, cancel := context.WithTimeout(ctx, llmTimeout)
+	defer cancel()
+	summaryContent, err := summarizeWithLLM(summaryCtx, markdown)
+	if err != nil {
+		// If LLM fails, log and return error.
+		logger.Error("Failed to summarize markdown with LLM for cache update", "error", err)
+		return fmt.Errorf("failed to summarize markdown with LLM: %w", err)
+	}
+
+	// 5. Generate summary RSS
+	// Use baseURL for the canonical requestURL
+	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL)
+	if err != nil {
+		// If summary RSS generation fails, log and return error.
+		logger.Error("Failed to generate summary RSS for cache update", "error", err)
+		return fmt.Errorf("failed to generate summary RSS: %w", err)
+	}
+
+	// 6. Update summary cache
+	err = rdb.Set(ctx, summaryCacheKey, summaryRSSBytes, cacheDuration).Err()
+	if err != nil {
+		// Log the error, but the feed cache might have updated successfully.
+		logger.Error("Failed to update summary cache", "key", summaryCacheKey, "error", err)
+		// Decide if this should return an overall error.
+		// Returning error indicates the full update wasn't successful.
+		return fmt.Errorf("failed to update summary cache: %w", err)
+	} else {
+		logger.Info("Successfully updated summary cache", "key", summaryCacheKey)
+	}
+
+	logger.Info("Successfully updated both feed and summary caches")
 	return nil
 }
 
@@ -617,6 +664,7 @@ func getCachedSummary(ctx context.Context, requestURL string) ([]byte, error) {
 	// Try to get from cache first
 	cachedData, err := rdb.Get(ctx, summaryCacheKey).Bytes()
 	if err == nil {
+		logger.Info("Summary cache hit", "key", summaryCacheKey)
 		return cachedData, nil
 	} else if !errors.Is(err, redis.Nil) {
 		logger.Warn("Redis Get failed for summary, generating summary directly", "key", summaryCacheKey, "error", err)
@@ -646,49 +694,26 @@ func getCachedSummary(ctx context.Context, requestURL string) ([]byte, error) {
 // It now accepts a context to pass down the call chain.
 func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, error) {
 	// Get the feed content, passing context
-	feed, err := getCachedFeed(ctx, requestURL)
+	// This now correctly uses the feed cache if available, or generates directly.
+	feedBytes, err := getCachedFeed(ctx, requestURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
 	
 	// Convert feed to markdown (no context needed for this part)
-	markdown, err := parseRSSToMarkdown(string(feed))
+	markdown, err := parseRSSToMarkdown(string(feedBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RSS to markdown for summary generation: %w", err)
 	}
 	
 	// Summarize with LLM, passing context
-	summary, err := summarizeWithLLM(ctx, markdown)
+	summaryContent, err := summarizeWithLLM(ctx, markdown)
 	if err != nil {
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
 	
-	return generateSummaryRSS(summary, requestURL)
-}
-
-// updateSummaryCache forces a refresh of the summary cache.
-// It now accepts a context for Redis operations and summary generation.
-func updateSummaryCache(ctx context.Context) error {
-	if !redisConnected {
-		return fmt.Errorf("redis not connected, cannot update summary cache")
-	}
-
-	logger.Info("Updating summary cache")
-	
-	// Generate new summary, passing context
-	summary, err := generateSummaryDirect(ctx, baseURL) // Use baseURL for the canonical cache content
-	if err != nil {
-		return fmt.Errorf("failed to generate summary for cache update: %w", err)
-	}
-
-	// Update cache, passing context
-	err = rdb.Set(ctx, summaryCacheKey, summary, cacheDuration).Err()
-	if err != nil {
-		return fmt.Errorf("failed to update summary cache: %w", err)
-	}
-
-	logger.Info("Successfully updated summary cache")
-	return nil
+	// Use the original requestURL for the summary RSS self-link
+	return generateSummaryRSS(summaryContent, requestURL)
 }
 
 // Handler handles all requests
@@ -765,26 +790,19 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Use request context for the update process. 
+			// Use request context for the update process.
 			// Consider background context if updates are long-running & shouldn't be tied to client connection.
-			err := updateCache(reqCtx) 
+			err := updateAllCaches(reqCtx)
 			if err != nil {
-				logger.Error("Failed to update feed cache via API", "error", err)
-				http.Error(w, fmt.Sprintf("Error updating cache: %v", err), http.StatusInternalServerError)
+				// Use a more specific error message if possible
+				logger.Error("Failed to update caches via API", "error", err)
+				http.Error(w, fmt.Sprintf("Error updating caches: %v", err), http.StatusInternalServerError)
 				return
 			}
 			
-			// Also update the summary cache, passing context
-			err = updateSummaryCache(reqCtx)
-			if err != nil {
-				logger.Error("Failed to update summary cache via API", "error", err)
-				http.Error(w, fmt.Sprintf("Error updating summary cache: %v", err), http.StatusInternalServerError)
-				return
-			}
-
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{
-				"status": "Cache updated successfully",
+				"status":    "Cache updated successfully",
 				"timestamp": time.Now().UTC().Format(time.RFC3339),
 			})
 			return
