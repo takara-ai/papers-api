@@ -500,6 +500,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 		markdown.WriteString("---\n\n")
 	}
 
+	// logger.Info("Markdown Generated", "markdown", markdown.String())
 	return markdown.String(), nil
 }
 
@@ -527,7 +528,7 @@ Format the output in HTML:
   <li>Keep the tone light and engaging</li>
 </ul>
 
-Keep it under 200 words. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.
+Keep it under 200 words. Start with the most impressive or important paper. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count. Write at maximum 4 list items.
 
 Do not enclose the HTML in a markdown code block, just return the HTML.
 
