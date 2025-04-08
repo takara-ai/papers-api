@@ -1,7 +1,7 @@
 name: Update Cache
 on:
   schedule:
-    - cron: '0 0 * * *'  # Daily at midnight UTC
+    - cron: '0 7 * * *'  # Daily at 7 am UTC
   workflow_dispatch:     # Allows manual triggering
 
 jobs:
