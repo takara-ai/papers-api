@@ -3,20 +3,28 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
+
+	// Import the attention package
+	"github.com/takara-ai/go-attention/attention"
 )
 
 const (
@@ -28,6 +36,8 @@ const (
 	cacheKey      = "hf_papers_cache"
 	summaryCacheKey = "hf_papers_summary_cache"
 	cacheDuration = 24 * time.Hour
+	// Define vector size for attention calculation
+	attentionVectorSize = 64
 )
 
 type Paper struct {
@@ -116,6 +126,29 @@ type LLMResponse struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+// New struct for attention score response
+type AttentionScoreResponse struct {
+	Paper1URL       string    `json:"paper1_url"`
+	Paper2URL       string    `json:"paper2_url"`
+	AttentionWeight float64   `json:"attention_weight"` // Attention weight from paper1 (query) to paper2 (key/value)
+	Timestamp       time.Time `json:"timestamp"`
+}
+
+// Struct for reporting a pair of papers with high attention
+type AttentionPair struct {
+	Paper1Title string  `json:"paper1_title"`
+	Paper1URL   string  `json:"paper1_url"`
+	Paper2Title string  `json:"paper2_title"`
+	Paper2URL   string  `json:"paper2_url"`
+	Score       float64 `json:"score"` // Attention score from Paper1 to Paper2
+}
+
+// Struct for the overall analysis response
+type AttentionAnalysisResponse struct {
+	TopPairs  []AttentionPair `json:"top_pairs"`
+	Timestamp time.Time       `json:"timestamp"`
 }
 
 var (
@@ -717,6 +750,308 @@ func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, erro
 	return generateSummaryRSS(summaryContent, requestURL)
 }
 
+// Helper function to get papers, handling cache and parsing
+// This might need refactoring for better caching of []Paper if performance becomes an issue
+func getPapersFromCacheOrScrape(ctx context.Context, requestURL string) ([]Paper, error) {
+	feedBytes, err := getCachedFeed(ctx, requestURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get feed for papers: %w", err)
+	}
+
+	var rssFeed RSS
+	err = xml.Unmarshal(feedBytes, &rssFeed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal feed XML: %w", err)
+	}
+
+	papers := make([]Paper, 0, len(rssFeed.Channel.Items))
+	for _, item := range rssFeed.Channel.Items {
+		// Attempt to parse PubDate, fallback to now if error
+		pubDate, parseErr := time.Parse(time.RFC1123Z, item.PubDate)
+		if parseErr != nil {
+			logger.Warn("Failed to parse PubDate from RSS item, using current time", "url", item.Link, "pubDateString", item.PubDate, "error", parseErr)
+			pubDate = time.Now().UTC()
+		}
+		papers = append(papers, Paper{
+			Title:    item.Title,
+			URL:      item.Link,
+			Abstract: item.Description.Text,
+			PubDate:  pubDate,
+		})
+	}
+	return papers, nil
+}
+
+// Simple placeholder function to convert abstract text to a fixed-size vector.
+// This is NOT a meaningful semantic embedding, just for demonstrating attention calculation.
+func abstractToVector(abstract string, size int) attention.Vector {
+	vec := make(attention.Vector, size)
+	if len(abstract) == 0 {
+		return vec // Return zero vector for empty abstract
+	}
+
+	// Use SHA256 hash to generate some deterministic numerical values
+	h := sha256.New()
+	h.Write([]byte(abstract))
+	hashBytes := h.Sum(nil)
+
+	// Fill the vector using bytes from the hash
+	for i := 0; i < size; i++ {
+		// Use 8 bytes chunk for float64
+		offset := (i * 8) % len(hashBytes)
+		end := offset + 8
+		if end > len(hashBytes) {
+			// Wrap around if not enough bytes
+			chunk := append(hashBytes[offset:], hashBytes[:end-len(hashBytes)]...)
+			bits := binary.LittleEndian.Uint64(chunk)
+			vec[i] = math.Float64frombits(bits) / float64(math.MaxUint64) // Normalize roughly
+		} else {
+			bits := binary.LittleEndian.Uint64(hashBytes[offset:end])
+			vec[i] = math.Float64frombits(bits) / float64(math.MaxUint64) // Normalize roughly
+		}
+	}
+	// Simple normalization (optional, makes weights more stable)
+	var norm float64
+	for _, val := range vec {
+		norm += val * val
+	}
+	norm = math.Sqrt(norm)
+	// Use a check to avoid excessive logging if called frequently, e.g., log only for specific abstracts if needed
+	/* // Remove debug
+	if strings.HasPrefix(abstract, "This is the unique placeholder abstract") { // Log only for debug abstracts
+		logger.Debug("Calculated norm before normalization", "abstract_prefix", abstract[:20], "norm", norm)
+	}
+	*/
+
+	if norm > 0 {
+		for i := range vec {
+			vec[i] /= norm
+		}
+	}
+
+	return vec
+}
+
+// calculateCosineSimilarity computes the dot product between two vectors.
+// Assumes vectors are already L2 normalized, so dot product equals cosine similarity.
+func calculateCosineSimilarity(v1, v2 attention.Vector) (float64, error) {
+	if len(v1) != len(v2) {
+		return 0, fmt.Errorf("vector lengths must match (%d != %d)", len(v1), len(v2))
+	}
+	if len(v1) == 0 {
+		return 0, fmt.Errorf("cannot compute dot product of zero-length vectors")
+	}
+
+	var dotProduct float64
+	for i := range v1 {
+		dotProduct += v1[i] * v2[i]
+	}
+	return dotProduct, nil
+}
+
+// handleAttentionScore calculates attention between two papers
+func handleAttentionScore(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	url1Param := r.URL.Query().Get("url1")
+	url2Param := r.URL.Query().Get("url2")
+
+	if url1Param == "" || url2Param == "" {
+		http.Error(w, "Missing required query parameters: url1 and url2", http.StatusBadRequest)
+		return
+	}
+	
+	// Normalize/decode URLs just in case they are encoded
+	url1, err1 := url.QueryUnescape(url1Param)
+	url2, err2 := url.QueryUnescape(url2Param)
+	if err1 != nil || err2 != nil {
+		http.Error(w, "Failed to decode paper URLs", http.StatusBadRequest)
+		return
+	}
+
+
+	// Fetch papers (this uses the feed cache implicitly)
+	// Note: The requestURL passed here is for the feed's self-link, doesn't affect paper content.
+	papers, err := getPapersFromCacheOrScrape(ctx, "https://"+r.Host+"/api/feed")
+	if err != nil {
+		logger.Error("Failed to get papers for attention calculation", "error", err)
+		http.Error(w, "Failed to retrieve paper data", http.StatusInternalServerError)
+		return
+	}
+
+	var abstract1, abstract2 string
+	found1, found2 := false, false
+
+	for _, p := range papers {
+		if p.URL == url1 {
+			abstract1 = p.Abstract
+			found1 = true
+		}
+		if p.URL == url2 {
+			abstract2 = p.Abstract
+			found2 = true
+		}
+		if found1 && found2 {
+			break
+		}
+	}
+
+	if !found1 || !found2 {
+		http.Error(w, "One or both specified paper URLs not found in the current feed", http.StatusNotFound)
+		return
+	}
+
+	// Convert abstracts to vectors (using placeholder method)
+	vector1 := abstractToVector(abstract1, attentionVectorSize)
+	vector2 := abstractToVector(abstract2, attentionVectorSize)
+
+	// Use DotProductAttention: paper1 (query) attends to paper2 (key/value)
+	query := vector1
+	keys := attention.Matrix{vector2}   // Key is paper2's vector
+	values := attention.Matrix{vector2} // Value is also paper2's vector
+
+	// Note: DotProductAttention returns output, weights, error.
+	// For a single key/value pair, the output is `weights[0] * value[0]`
+	// The weights themselves represent the raw attention score before softmax (if it were applied).
+	// We'll use the calculated weight directly.
+	_, weights, err := attention.DotProductAttention(query, keys, values)
+	if err != nil {
+		// This might happen if vectors have incompatible sizes, though our function ensures they match.
+		logger.Error("Error calculating dot product attention", "error", err)
+		http.Error(w, "Failed to calculate attention score", http.StatusInternalServerError)
+		return
+	}
+
+	attentionWeight := 0.0
+	if len(weights) > 0 {
+		attentionWeight = weights[0] // The attention weight from query (paper1) to the single key (paper2)
+	}
+
+	// Prepare response
+	response := AttentionScoreResponse{
+		Paper1URL:       url1,
+		Paper2URL:       url2,
+		AttentionWeight: attentionWeight,
+		Timestamp:       time.Now().UTC(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		logger.Error("Failed to encode attention score response", "error", err)
+		// Avoid writing error after header might have been set
+	}
+}
+
+// handleAttentionAnalysis calculates pairwise attention scores for the whole feed
+func handleAttentionAnalysis(w http.ResponseWriter, r *http.Request) {
+	const topN = 5 // Number of top pairs to return
+	ctx := r.Context()
+	useDebugData := false // Set back to false to use real data
+
+	var papers []Paper
+	var err error
+
+	// Remove the if/else for debug data, always fetch real papers now
+	// Fetch real papers
+	papers, err = getPapersFromCacheOrScrape(ctx, "https://"+r.Host+"/api/feed")
+	if err != nil {
+		logger.Error("Failed to get papers for attention analysis", "error", err)
+		http.Error(w, "Failed to retrieve paper data", http.StatusInternalServerError)
+		return
+	}
+
+	if len(papers) < 2 {
+		http.Error(w, "Not enough papers in the feed to perform analysis (need at least 2)", http.StatusPreconditionFailed)
+		return
+	}
+
+	// Generate vectors for all papers
+	paperVectors := make(map[string]attention.Vector) // Map URL to Vector
+	paperMap := make(map[string]Paper)             // Map URL to Paper
+	for _, p := range papers { // Use blank identifier _ instead of i
+		vector := abstractToVector(p.Abstract, attentionVectorSize)
+		paperVectors[p.URL] = vector
+		paperMap[p.URL] = p
+	}
+
+	var allPairs []AttentionPair
+	const placeholderAbstract = "[Abstract not available]"
+
+	// Calculate pairwise attention (i -> j)
+	for i, p1 := range papers {
+		// Skip if paper 1 has placeholder abstract - Only applicable when not using debug data
+		if !useDebugData && p1.Abstract == placeholderAbstract {
+			continue
+		}
+		queryVec := paperVectors[p1.URL]
+
+		// --- Corrected Attention Calculation ---
+		// Build keys/values matrices EXCLUDING the current query paper (p1)
+		keys := make(attention.Matrix, 0, len(papers)-1)
+		values := make(attention.Matrix, 0, len(papers)-1)
+		keyPapers := make([]Paper, 0, len(papers)-1) // Keep track of which paper corresponds to each key
+
+		for j, p2 := range papers {
+			if i == j { // Skip self
+				continue
+			}
+			// Skip if paper 2 has placeholder abstract - Only applicable when not using debug data
+			if !useDebugData && p2.Abstract == placeholderAbstract {
+				continue
+			}
+			keys = append(keys, paperVectors[p2.URL])
+			values = append(values, paperVectors[p2.URL]) // Using same vector for key and value
+			keyPapers = append(keyPapers, p2)
+		}
+
+		// Check if there are any valid keys to compare against
+		if len(keys) == 0 {
+			continue // No valid papers to compare p1 against
+		}
+
+		// Call DotProductAttention ONCE per query paper against all other valid papers
+		_, weights, err := attention.DotProductAttention(queryVec, keys, values)
+		if err != nil {
+			logger.Warn("Error calculating batch attention for query paper", "query_url", p1.URL, "error", err)
+			continue
+		}
+		
+		// Add all pairs generated from this query to the list
+		for k, score := range weights {
+			p2 := keyPapers[k] // Get the corresponding key paper
+			allPairs = append(allPairs, AttentionPair{
+				Paper1Title: p1.Title,
+				Paper1URL:   p1.URL,
+				Paper2Title: p2.Title,
+				Paper2URL:   p2.URL,
+				Score:       score, // This is the softmax-normalized weight
+			})
+		}
+		// --- End Corrected Attention Calculation ---
+	}
+
+	// Sort pairs by score descending
+	sort.Slice(allPairs, func(i, j int) bool {
+		return allPairs[i].Score > allPairs[j].Score
+	})
+
+	// Get the top N pairs
+	topPairs := allPairs
+	if len(topPairs) > topN {
+		topPairs = topPairs[:topN]
+	}
+
+	// Prepare response
+	response := AttentionAnalysisResponse{
+		TopPairs:  topPairs,
+		Timestamp: time.Now().UTC(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		logger.Error("Failed to encode attention analysis response", "error", err)
+	}
+}
+
 // Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// Initialize Redis on first request (using background context for initialization)
@@ -744,10 +1079,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			healthStatus := map[string]interface{}{
 				"status":       "ok",
-				"endpoints":    []string{"/api/feed", "/api/summary"},
+				"endpoints":    []string{"/api/feed", "/api/summary", "/api/attention", "/api/attention_analysis"},
 				"cache_status": redisConnected,
 				"timestamp":    time.Now().UTC().Format(time.RFC3339),
-				"version":      "1.0.0",
+				"version":      "1.1.0",
 			}
 			
 			if err := json.NewEncoder(w).Encode(healthStatus); err != nil {
@@ -806,6 +1141,16 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				"status":    "Cache updated successfully",
 				"timestamp": time.Now().UTC().Format(time.RFC3339),
 			})
+			return
+
+		// New route for attention score
+		case "/api/attention":
+			handleAttentionScore(w, r)
+			return
+
+		// New route for attention analysis of the whole feed
+		case "/api/attention_analysis":
+			handleAttentionAnalysis(w, r)
 			return
 
 		default:
