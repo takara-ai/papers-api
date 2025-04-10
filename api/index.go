@@ -461,6 +461,7 @@ func updateAllCaches(ctx context.Context) error {
 		return fmt.Errorf("failed to generate summary RSS: %w", err)
 	}
 
+	logger.Info("Successfully updated both feed and summary caches")
 	// 6. Update summary cache
 	err = rdb.Set(ctx, summaryCacheKey, summaryRSSBytes, cacheDuration).Err()
 	if err != nil {
@@ -489,7 +490,61 @@ func updateAllCaches(ctx context.Context) error {
 		logger.Info("Successfully updated conversation cache", "key", conversationCacheKey)
 	}
 
-	logger.Info("Successfully updated both feed and summary caches")
+	// In updateAllCaches function
+	// After generating summary RSS
+
+	// Generate and update conversation with proper error handling
+	logger.Info("Starting conversation cache update")
+
+	// Parse RSS bytes to get text content for conversation generation
+	conversation, err = generatePodcastConversation(ctx, string(summaryRSSBytes))
+	if err != nil {
+		logger.Error("Failed to generate podcast conversation", "error", err)
+		return fmt.Errorf("failed to generate podcast conversation: %w", err)
+	}
+
+	// Add logging before cache update
+	logger.Info("Attempting to update conversation cache",
+		"key", conversationCacheKey,
+		"contentLength", len(conversation))
+
+	// Update conversation cache with proper error handling
+	err = rdb.Set(ctx, conversationCacheKey, []byte(conversation), cacheDuration).Err()
+	if err != nil {
+		logger.Error("Failed to update conversation cache",
+			"key", conversationCacheKey,
+			"error", err)
+		return fmt.Errorf("failed to update conversation cache: %w", err)
+	}
+
+	logger.Info("Successfully updated conversation cache",
+		"key", conversationCacheKey)
+
+	// After conversation cache update
+	logger.Info("Starting podcast cache update")
+
+	// Generate audio podcast from conversation
+	audioData, err := generateaudiopodcast(ctx, conversation)
+	if err != nil {
+		logger.Error("Failed to generate podcast audio", "error", err)
+		return fmt.Errorf("failed to generate podcast audio: %w", err)
+	}
+
+	// Update podcast cache
+	err = rdb.Set(ctx, podcastCacheKey, audioData, cacheDuration).Err()
+	if err != nil {
+		logger.Error("Failed to update podcast cache",
+			"key", podcastCacheKey,
+			"size", len(audioData),
+			"error", err)
+		return fmt.Errorf("failed to update podcast cache: %w", err)
+	}
+
+	logger.Info("Successfully updated podcast cache",
+		"key", podcastCacheKey,
+		"size", len(audioData))
+
+	logger.Info("Successfully updated all caches (feed, summary, conversation, and podcast)")
 	return nil
 }
 
@@ -793,22 +848,6 @@ func extractConversation(ctx context.Context, text string, maxRetries int) (*Con
 
 func tryGenerateConversation(ctx context.Context, text string) (*ConversationData, error) {
 
-	// Check if Redis is connected
-	if redisConnected {
-		cachedData, err := rdb.Get(ctx, conversationCacheKey).Bytes()
-		if err == nil {
-			logger.Info("Conversation cache hit", "key", conversationCacheKey)
-			var conversation ConversationData
-			if err := json.Unmarshal(cachedData, &conversation); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal cached conversation: %w", err)
-			}
-			return &conversation, nil
-		} else if !errors.Is(err, redis.Nil) {
-			logger.Warn("Redis Get failed for conversation, generating conversation directly", "key", conversationCacheKey, "error", err)
-		} else {
-			logger.Info("Conversation cache miss, generating new conversation")
-		}
-	}
 	apiURL := "https://router.huggingface.co/sambanova/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
 
@@ -1040,16 +1079,17 @@ func generateaudiopodcast(ctx context.Context, text string) ([]byte, error) {
 }
 
 func getcachedpodcast(ctx context.Context, text string) ([]byte, error) {
-	// Check if Redis is connected
 	if redisConnected {
-		cachedData, err := rdb.Get(ctx, podcastCacheKey).Bytes()
+		audioData, err := rdb.Get(ctx, podcastCacheKey).Bytes()
 		if err == nil {
-			logger.Info("Podcast cache hit", "key", podcastCacheKey)
-			return cachedData, nil
+			logger.Info("Podcast cache hit",
+				"key", podcastCacheKey,
+				"size", len(audioData))
+			return audioData, nil
 		} else if !errors.Is(err, redis.Nil) {
-			logger.Warn("Redis Get failed for podcast, generating podcast directly", "key", podcastCacheKey, "error", err)
-		} else {
-			logger.Info("Podcast cache miss, generating new podcast")
+			logger.Warn("Redis Get failed for podcast",
+				"key", podcastCacheKey,
+				"error", err)
 		}
 	}
 
@@ -1067,14 +1107,17 @@ func getcachedpodcast(ctx context.Context, text string) ([]byte, error) {
 
 	// Cache the audio data if Redis is connected
 	if redisConnected {
-
-		logger.Info("For now we are not caching the podcast audio data")
-		// err = rdb.Set(ctx, podcastCacheKey, audioData, cacheDuration).Err()
-		// if err != nil {
-		// 	logger.Warn("Failed to cache podcast", "key", podcastCacheKey, "error", err)
-		// } else {
-		// 	logger.Info("Successfully cached new podcast")
-		// }
+		err = rdb.Set(ctx, podcastCacheKey, audioData, cacheDuration).Err()
+		if err != nil {
+			logger.Warn("Failed to cache podcast",
+				"key", podcastCacheKey,
+				"size", len(audioData),
+				"error", err)
+		} else {
+			logger.Info("Successfully cached new podcast",
+				"key", podcastCacheKey,
+				"size", len(audioData))
+		}
 	}
 
 	return audioData, nil
@@ -1107,7 +1150,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			healthStatus := map[string]interface{}{
 				"status":       "ok",
-				"endpoints":    []string{"/api/feed", "/api/summary", "/api/conversation","/api/podcast"},
+				"endpoints":    []string{"/api/feed", "/api/summary", "/api/conversation", "/api/podcast"},
 				"cache_status": redisConnected,
 				"timestamp":    time.Now().UTC().Format(time.RFC3339),
 				"version":      "1.0.0",
@@ -1164,7 +1207,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			// Write the conversation response
 			w.Write([]byte(conversation))
 			return
-
+			
 		case "/api/podcast":
 			summary, err := getCachedSummary(reqCtx, requestURL)
 			if err != nil {
@@ -1181,9 +1224,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Set headers
+			// Set more specific headers for MP3 audio
 			w.Header().Set("Content-Type", "audio/mpeg")
+			w.Header().Set("Content-Disposition", "inline; filename=\"daily-papers-podcast.mp3\"")
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
+			w.Header().Set("Accept-Ranges", "bytes")
 
 			// Write the audio data directly to response
 			if _, err := w.Write(audioData); err != nil {
