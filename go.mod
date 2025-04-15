@@ -5,6 +5,7 @@ go 1.23
 toolchain go1.23.4
 
 require (
+	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.7.0
 	golang.org/x/net v0.32.0
 )
