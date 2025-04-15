@@ -507,7 +507,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 // summarizeWithLLM summarizes the markdown content using Hugging Face Router API
 // It now accepts a context for cancellation and timeout, and uses an HTTP client with a timeout.
 func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
-	apiURL := "https://router.huggingface.co/sambanova/v1/chat/completions"
+	apiURL := "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-72B-Instruct/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
 	
 	if apiKey == "" {
@@ -536,7 +536,7 @@ Below are the paper abstracts and information in markdown format:
 ` + markdownContent
 
 	request := LLMRequest{
-		Model: "Qwen2.5-72B-Instruct",
+		Model: "Qwen/Qwen2.5-72B-Instruct",
 		Messages: []Message{
 			{
 				Role:    "user",
