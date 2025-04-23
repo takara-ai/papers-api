@@ -850,7 +850,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			healthStatus := map[string]interface{}{
 				"status":       "ok",
-				"endpoints":    []string{"/api/feed", "/api/summary", "/api/conversation", "/api/podcast"},
+				"endpoints":    []string{"/api/feed", "/api/summary"},
 				"timestamp":    time.Now().UTC().Format(time.RFC3339),
 				"version":      "1.1.0",
 			}
@@ -890,68 +890,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
 			w.Header().Set("Content-Type", "application/rss+xml")
 			w.Write(summary)
-			return
-
-		case "/api/conversation":
-			// Get summary first (which will now be generated directly if not edge-cached)
-			summaryBytes, err := generateSummary(reqCtx, requestURL)
-			if err != nil {
-				logger.Error("Failed to generate summary for conversation", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating summary for conversation: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			// Generate podcast conversation directly
-			conversation, err := generatePodcastConversation(reqCtx, string(summaryBytes))
-			if err != nil {
-				logger.Error("Failed to generate podcast conversation", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating podcast conversation: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			// Set Vercel Edge Cache headers
-			secondsToCache := calculateSecondsUntilNext6AMUTC()
-			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(conversation))
-			return
-
-		case "/api/podcast":
-			// Get summary first
-			summaryBytes, err := generateSummary(reqCtx, requestURL)
-			if err != nil {
-				logger.Error("Failed to generate summary for podcast", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating summary for podcast: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			// Generate conversation directly (needed for audio generation)
-			conversation, err := generatePodcastConversation(reqCtx, string(summaryBytes))
-			if err != nil {
-				logger.Error("Failed to generate conversation for podcast", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating conversation for podcast: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			// Generate audio podcast directly
-			audioData, err := generateaudiopodcast(reqCtx, conversation)
-			if err != nil {
-				logger.Error("Failed to generate podcast audio", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating podcast audio: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			// Set Vercel Edge Cache headers
-			secondsToCache := calculateSecondsUntilNext6AMUTC()
-			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
-			w.Header().Set("Content-Type", "audio/mpeg")
-			w.Header().Set("Content-Disposition", "inline; filename=\"daily-papers-podcast.mp3\"")
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
-			w.Header().Set("Accept-Ranges", "bytes")
-
-			if _, err := w.Write(audioData); err != nil {
-				logger.Error("Failed to write audio response", "error", err)
-			}
 			return
 
 		default:

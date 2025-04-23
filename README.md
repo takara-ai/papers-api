@@ -89,8 +89,6 @@ The local server will be available at `http://localhost:3000`
 - `/api` - Health check and status
 - `/api/feed` - RSS feed of papers
 - `/api/summary` - RSS feed summarizing the papers using an LLM
-- `/api/conversation` - JSON feed containing the generated podcast conversation
-- `/api/podcast` - MP3 audio feed of the generated podcast
 
 ## Caching
 
@@ -100,6 +98,28 @@ This service leverages Vercel's Edge Caching. Responses are cached globally with
 - **Cache Control:** `public, max-age=0, s-maxage=<seconds_until_6am_utc>`
 - **Invalidation:** Cache automatically expires based on `s-maxage` or when a new deployment occurs.
 
+## Performance Comparison
+
+### Sequential `curl` Benchmark
+
+A basic sequential benchmark using `curl` from a single location provides a rough latency comparison.
+
+| Version        | Request # | Time (seconds)  | Notes                |
+| -------------- | --------- | --------------- | -------------------- |
+| Redis (Legacy) | 1         | 0.022432        | @ `papers.takara.ai` |
+| Redis (Legacy) | 2         | 0.020673        |                      |
+| Redis (Legacy) | 3         | 0.021362        |                      |
+| Redis (Legacy) | 4         | 0.022083        |                      |
+| Redis (Legacy) | 5         | 0.016121        |                      |
+| Redis (Legacy) | 6         | 0.018705        |                      |
+| Redis (Legacy) | 7         | 0.017078        |                      |
+| Redis (Legacy) | 8         | 0.018801        |                      |
+| Redis (Legacy) | 9         | 0.018036        |                      |
+| Redis (Legacy) | 10        | 0.026124        |                      |
+| Vercel Edge    | _1-10_    | _(To be added)_ | _(New version)_      |
+
+_Note: This sequential `curl` test does not represent performance under concurrent load. Vercel Edge Caching is expected to offer better global performance._
+
 ## Example Response
 
 Health check (`/api`):
@@ -107,12 +127,7 @@ Health check (`/api`):
 ```json
 {
   "status": "ok",
-  "endpoints": [
-    "/api/feed",
-    "/api/summary",
-    "/api/conversation",
-    "/api/podcast"
-  ],
+  "endpoints": ["/api/feed", "/api/summary"],
   "timestamp": "2024-07-29T10:00:00Z",
   "version": "1.1.0"
 }
