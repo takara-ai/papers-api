@@ -9,25 +9,35 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/joho/godotenv"
 	"golang.org/x/net/html"
 )
 
+func init() {
+	// Load environment variables from .env file
+	if err := godotenv.Load(); err != nil {
+		slog.Warn("No .env file found, using environment variables")
+	}
+}
+
 const (
-	baseURL       = "https://huggingface.co/papers"
-	liveURL       = "https://tldr.takara.ai"
-	scrapeTimeout = 30 * time.Second
-	llmTimeout    = 90 * time.Second
-	maxPapers     = 50
-	cacheKey      = "hf_papers_cache"
-	summaryCacheKey = "hf_papers_summary_cache"
-	cacheDuration = 24 * time.Hour
+	baseURL              = "https://huggingface.co/papers"
+	liveURL              = "https://tldr.takara.ai"
+	scrapeTimeout        = 30 * time.Second
+	llmTimeout           = 90 * time.Second
+	maxPapers            = 50
+	cacheKey             = "hf_papers_cache"
+	summaryCacheKey      = "hf_papers_summary_cache"
+	conversationCacheKey = "hf_papers_conversation_cache"
+	podcastCacheKey      = "hf_papers_podcast_cache"
+	cacheDuration        = 24 * time.Hour
 )
 
 type Paper struct {
@@ -45,12 +55,12 @@ type RSS struct {
 }
 
 type Channel struct {
-	Title         string    `xml:"title"`
-	Link          string    `xml:"link"`
-	Description   string    `xml:"description"`
-	LastBuildDate string    `xml:"lastBuildDate"`
-	AtomLink      AtomLink  `xml:"atom:link"`
-	Items         []Item    `xml:"item"`
+	Title         string   `xml:"title"`
+	Link          string   `xml:"link"`
+	Description   string   `xml:"description"`
+	LastBuildDate string   `xml:"lastBuildDate"`
+	AtomLink      AtomLink `xml:"atom:link"`
+	Items         []Item   `xml:"item"`
 }
 
 type AtomLink struct {
@@ -79,16 +89,16 @@ type CDATA struct {
 
 // LLM API structures
 type LLMRequest struct {
-	Model               string    `json:"model"`
-	Messages            []Message `json:"messages"`
-	MaxTokens           int       `json:"max_tokens"`
-	Stream              bool      `json:"stream"`
-	StreamOptions       struct {
+	Model         string    `json:"model"`
+	Messages      []Message `json:"messages"`
+	MaxTokens     int       `json:"max_tokens"`
+	Stream        bool      `json:"stream"`
+	StreamOptions struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
-	Temperature         float64 `json:"temperature"`
-	TopP               float64 `json:"top_p"`
-	SeparateReasoning  bool    `json:"separate_reasoning"`
+	Temperature       float64 `json:"temperature"`
+	TopP              float64 `json:"top_p"`
+	SeparateReasoning bool    `json:"separate_reasoning"`
 }
 
 type Message struct {
@@ -98,10 +108,10 @@ type Message struct {
 }
 
 type LLMResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
+	ID      string  `json:"id"`
+	Object  string  `json:"object"`
 	Created float64 `json:"created"`
-	Model   string `json:"model"`
+	Model   string  `json:"model"`
 	Choices []struct {
 		Index   int `json:"index"`
 		Message struct {
@@ -119,10 +129,7 @@ type LLMResponse struct {
 }
 
 var (
-	rdb *redis.Client
-	ctx = context.Background()
-	redisConnected bool
-	initOnce sync.Once
+	ctx    = context.Background()
 	logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 )
 
@@ -130,12 +137,12 @@ func scrapeAbstract(ctx context.Context, url string) (string, error) {
 	client := &http.Client{
 		Timeout: scrapeTimeout,
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request for %s: %w", url, err)
 	}
-	
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -148,7 +155,7 @@ func scrapeAbstract(ctx context.Context, url string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to fetch abstract from %s: status code %d", url, resp.StatusCode)
 	}
-	
+
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse HTML from %s: %w", url, err)
@@ -179,7 +186,7 @@ func scrapeAbstract(ctx context.Context, url string) (string, error) {
 	if !found {
 		logger.Warn("Abstract div not found", "class", "pb-8 pr-4 md:pr-16", "url", url)
 	}
-	
+
 	abstract = strings.TrimPrefix(abstract, "Abstract")
 	abstract = strings.ReplaceAll(abstract, "\n", " ")
 	return strings.TrimSpace(abstract), nil
@@ -200,12 +207,12 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 	client := &http.Client{
 		Timeout: scrapeTimeout,
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request for %s: %w", baseURL, err)
 	}
-	
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -218,7 +225,7 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to fetch papers from %s: status code %d", baseURL, resp.StatusCode)
 	}
-	
+
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse HTML from %s: %w", baseURL, err)
@@ -241,7 +248,7 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 					break
 				}
 			}
-			
+
 			if href != "" {
 				url := fmt.Sprintf("https://huggingface.co%s", href)
 				abstract, err := scrapeAbstract(ctx, url)
@@ -282,7 +289,7 @@ func generateRSS(papers []Paper, requestURL string) ([]byte, error) {
 			PubDate:     paper.PubDate.Format(time.RFC1123Z),
 			GUID: GUID{
 				IsPermaLink: true,
-				Text:       paper.URL,
+				Text:        paper.URL,
 			},
 		}
 	}
@@ -309,7 +316,7 @@ func generateRSS(papers []Paper, requestURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Prepend the XML header
 	return append([]byte(xml.Header), output...), nil
 }
@@ -320,7 +327,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		
+
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -329,141 +336,13 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func initRedis() {
-	redisURL := os.Getenv("KV_URL")
-	if redisURL == "" {
-		return
-	}
-
-	opt, err := redis.ParseURL(redisURL)
-	if err != nil {
-		logger.Error("Error parsing Redis URL", "error", err)
-		return
-	}
-
-	rdb = redis.NewClient(opt)
-	pingErr := rdb.Ping(ctx).Err()
-	if pingErr != nil {
-		logger.Error("Error connecting to Redis", "error", pingErr)
-		return
-	}
-
-	redisConnected = true
-	logger.Info("Successfully connected to Redis")
-}
-
-func getCachedFeed(ctx context.Context, requestURL string) ([]byte, error) {
-	if !redisConnected {
-		return generateFeedDirect(ctx, requestURL)
-	}
-
-	// Try to get from cache first
-	cachedData, err := rdb.Get(ctx, cacheKey).Bytes()
-	if err == nil {
-		return cachedData, nil
-	} else if !errors.Is(err, redis.Nil) {
-		logger.Warn("Redis Get failed, generating feed directly", "key", cacheKey, "error", err)
-	}
-
-	// Cache miss or Redis error, generate new feed
-	feed, err := generateFeedDirect(ctx, requestURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate direct feed: %w", err)
-	}
-
-	// Cache the new feed if Redis is connected
-	if redisConnected {
-		err = rdb.Set(ctx, cacheKey, feed, cacheDuration).Err()
-		if err != nil {
-			logger.Warn("Failed to cache feed", "key", cacheKey, "error", err)
-		}
-	}
-
-	return feed, nil
-}
-
-func generateFeedDirect(ctx context.Context, requestURL string) ([]byte, error) {
+func generateFeed(ctx context.Context, requestURL string) ([]byte, error) {
 	// Pass context to scrapePapers
 	papers, err := scrapePapers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed scraping papers: %w", err)
 	}
 	return generateRSS(papers, requestURL)
-}
-
-// updateAllCaches generates fresh feed and summary data and updates both caches.
-func updateAllCaches(ctx context.Context) error {
-	if !redisConnected {
-		return fmt.Errorf("redis not connected, cannot update caches")
-	}
-
-	logger.Info("Starting cache update for feed and summary")
-
-	// 1. Generate fresh feed data
-	// Use baseURL for the canonical cache content's requestURL in generateRSS
-	freshFeedBytes, err := generateFeedDirect(ctx, baseURL)
-	if err != nil {
-		return fmt.Errorf("failed to generate direct feed for cache update: %w", err)
-	}
-
-	// 2. Update feed cache
-	// Use a separate context for Redis operations if needed, but reqCtx is usually fine
-	// Adding a small timeout specifically for Redis Set might be wise.
-	err = rdb.Set(ctx, cacheKey, freshFeedBytes, cacheDuration).Err()
-	if err != nil {
-		// Log the error but continue to attempt summary update if possible
-		logger.Error("Failed to update feed cache", "key", cacheKey, "error", err)
-		// Decide if this error should prevent summary update (e.g., return err here)
-		// For now, we log and continue.
-	} else {
-		logger.Info("Successfully updated feed cache", "key", cacheKey)
-	}
-
-
-	// --- Summary Update ---
-
-	// 3. Parse the *fresh* feed bytes to markdown
-	markdown, err := parseRSSToMarkdown(string(freshFeedBytes))
-	if err != nil {
-		// If parsing fails, we cannot generate a summary. Log and return error.
-		logger.Error("Failed to parse fresh feed to markdown for summary update", "error", err)
-		return fmt.Errorf("failed to parse fresh feed to markdown: %w", err)
-	}
-
-	// 4. Summarize markdown with LLM
-	// Use a context with appropriate timeout for the LLM call
-	summaryCtx, cancel := context.WithTimeout(ctx, llmTimeout)
-	defer cancel()
-	summaryContent, err := summarizeWithLLM(summaryCtx, markdown)
-	if err != nil {
-		// If LLM fails, log and return error.
-		logger.Error("Failed to summarize markdown with LLM for cache update", "error", err)
-		return fmt.Errorf("failed to summarize markdown with LLM: %w", err)
-	}
-
-	// 5. Generate summary RSS
-	// Use baseURL for the canonical requestURL
-	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL)
-	if err != nil {
-		// If summary RSS generation fails, log and return error.
-		logger.Error("Failed to generate summary RSS for cache update", "error", err)
-		return fmt.Errorf("failed to generate summary RSS: %w", err)
-	}
-
-	// 6. Update summary cache
-	err = rdb.Set(ctx, summaryCacheKey, summaryRSSBytes, cacheDuration).Err()
-	if err != nil {
-		// Log the error, but the feed cache might have updated successfully.
-		logger.Error("Failed to update summary cache", "key", summaryCacheKey, "error", err)
-		// Decide if this should return an overall error.
-		// Returning error indicates the full update wasn't successful.
-		return fmt.Errorf("failed to update summary cache: %w", err)
-	} else {
-		logger.Info("Successfully updated summary cache", "key", summaryCacheKey)
-	}
-
-	logger.Info("Successfully updated both feed and summary caches")
-	return nil
 }
 
 func parseRSSToMarkdown(xmlContent string) (string, error) {
@@ -494,7 +373,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 	for _, item := range rss.Channel.Items {
 		title := strings.ReplaceAll(item.Title, "\n", " ")
 		title = strings.TrimSpace(title)
-		
+
 		markdown.WriteString(fmt.Sprintf("## [%s](%s)\n\n", title, item.Link))
 		markdown.WriteString(fmt.Sprintf("%s\n\n", item.Description.Text))
 		markdown.WriteString("---\n\n")
@@ -509,7 +388,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
 	apiURL := "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-72B-Instruct/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
-	
+
 	if apiKey == "" {
 		return "", fmt.Errorf("HF_API_KEY environment variable is not set")
 	}
@@ -543,16 +422,16 @@ Below are the paper abstracts and information in markdown format:
 				Content: prompt,
 			},
 		},
-		MaxTokens:          4096,
-		Stream:             false,
+		MaxTokens: 4096,
+		Stream:    false,
 		StreamOptions: struct {
 			IncludeUsage bool `json:"include_usage"`
 		}{
 			IncludeUsage: true,
 		},
-		Temperature:        0.6,
+		Temperature:       0.6,
 		TopP:              0.95,
-		SeparateReasoning:  true,
+		SeparateReasoning: true,
 	}
 
 	requestBody, err := json.Marshal(request)
@@ -612,10 +491,10 @@ Below are the paper abstracts and information in markdown format:
 
 func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 	now := time.Now().UTC()
-	
+
 	// Ensure the summary is properly wrapped in a div for better HTML structure
 	summary = fmt.Sprintf("<div>%s</div>", summary)
-	
+
 	item := Item{
 		Title:       "AI Research Papers Summary for " + now.Format("January 2, 2006"),
 		Link:        liveURL,
@@ -623,10 +502,10 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 		PubDate:     now.Format(time.RFC1123Z),
 		GUID: GUID{
 			IsPermaLink: false,
-			Text:       fmt.Sprintf("summary-%s", now.Format("2006-01-02")),
+			Text:        fmt.Sprintf("summary-%s", now.Format("2006-01-02")),
 		},
 	}
-	
+
 	rss := RSS{
 		Version: "2.0",
 		XMLNS:   "http://www.w3.org/2005/Atom",
@@ -649,88 +528,315 @@ func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal summary RSS: %w", err)
 	}
-	
+
 	// Prepend the XML header
 	return append([]byte(xml.Header), output...), nil
 }
 
-// getCachedSummary retrieves the summary from cache or generates it if missed.
-// It now accepts a context for Redis operations and summary generation.
-func getCachedSummary(ctx context.Context, requestURL string) ([]byte, error) {
-	if !redisConnected {
-		logger.Warn("Redis not connected, generating summary directly")
-		return generateSummaryDirect(ctx, requestURL)
-	}
-
-	// Try to get from cache first
-	cachedData, err := rdb.Get(ctx, summaryCacheKey).Bytes()
-	if err == nil {
-		logger.Info("Summary cache hit", "key", summaryCacheKey)
-		return cachedData, nil
-	} else if !errors.Is(err, redis.Nil) {
-		logger.Warn("Redis Get failed for summary, generating summary directly", "key", summaryCacheKey, "error", err)
-	}
-
-	// Cache miss or Redis error, generate new summary
-	logger.Info("Summary cache miss, generating new summary")
-	summary, err := generateSummaryDirect(ctx, requestURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate summary directly after cache miss: %w", err)
-	}
-
-	// Cache the new summary if Redis is connected
-	if redisConnected {
-		err = rdb.Set(ctx, summaryCacheKey, summary, cacheDuration).Err()
-		if err != nil {
-			logger.Warn("Failed to cache summary", "key", summaryCacheKey, "error", err)
-		} else {
-			logger.Info("Successfully cached new summary")
-		}
-	}
-
-	return summary, nil
-}
-
-// generateSummaryDirect generates the summary by getting feed, parsing, and calling LLM.
-// It now accepts a context to pass down the call chain.
-func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, error) {
+func generateSummary(ctx context.Context, requestURL string) ([]byte, error) {
 	// Get the feed content, passing context
-	// This now correctly uses the feed cache if available, or generates directly.
-	feedBytes, err := getCachedFeed(ctx, requestURL)
+	// Directly generate the feed now instead of checking cache
+	feedBytes, err := generateFeed(ctx, requestURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
-	
+
 	// Convert feed to markdown (no context needed for this part)
 	markdown, err := parseRSSToMarkdown(string(feedBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RSS to markdown for summary generation: %w", err)
 	}
-	
+
 	// Summarize with LLM, passing context
 	summaryContent, err := summarizeWithLLM(ctx, markdown)
 	if err != nil {
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
-	
+
 	// Use the original requestURL for the summary RSS self-link
 	return generateSummaryRSS(summaryContent, requestURL)
 }
 
+// Conversation represents the structure of a podcast conversation
+type ConversationData struct {
+	Conversation []DialogueEntry `json:"conversation"`
+}
+
+type DialogueEntry struct {
+	Speaker string `json:"speaker"`
+	Text    string `json:"text"`
+}
+
+func extractConversation(ctx context.Context, text string, maxRetries int) (*ConversationData, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		logger.Info("Attempting to generate conversation", "attempt", attempt, "maxRetries", maxRetries)
+
+		// Create a context with timeout for this attempt
+		attemptCtx, cancel := context.WithTimeout(ctx, llmTimeout)
+		defer cancel()
+
+		conversation, err := tryGenerateConversation(attemptCtx, text)
+		if err == nil {
+			return conversation, nil
+		}
+
+		lastErr = err
+		logger.Warn("Conversation generation attempt failed",
+			"attempt", attempt,
+			"error", err,
+			"remainingRetries", maxRetries-attempt)
+
+		if attempt < maxRetries {
+			// Exponential backoff with jitter
+			backoff := time.Duration(attempt*2) * time.Second
+			jitter := time.Duration(rand.Int63n(1000)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled during retry wait: %w", ctx.Err())
+			case <-time.After(backoff + jitter):
+				continue
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("failed to generate conversation after %d attempts: %w", maxRetries, lastErr)
+}
+
+func tryGenerateConversation(ctx context.Context, text string) (*ConversationData, error) {
+
+	apiURL := "https://router.huggingface.co/sambanova/v1/chat/completions"
+	apiKey := os.Getenv("HF_API_KEY")
+
+	if apiKey == "" {
+		return nil, fmt.Errorf("HF_API_KEY environment variable is not set")
+	}
+
+	prompt := fmt.Sprintf(`Welcome to Daily Papers! Today, we're diving into the latest AI research in an engaging and 
+        informative discussion. The goal is to make it a **bite-sized podcast** that's **engaging, natural, and insightful** while covering 
+        the key points of each paper.
+
+        Here are today's research papers:
+        %s
+
+        Convert this into a **conversational podcast-style discussion** between two experts, Brian and Jenny. 
+        Ensure the conversation:
+        1. Flows naturally with realistic back-and-forth dialogue
+        2. Uses casual phrasing and occasional filler words (like "um", "you know")
+        3. Maintains professional insights while being engaging
+        4. Covers each paper meaningfully but concisely
+        5. Focuses on practical implications and key findings
+        6. Keeps a dynamic pace with natural transitions
+		7. Avoid's Host calling each other by name, just "you" and "I".
+
+        Return the conversation in this exact JSON format:
+        {
+            "conversation": [
+                {"speaker": "Brian", "text": ""},
+                {"speaker": "Jenny", "text": ""}
+            ]
+        }`, text)
+
+	request := LLMRequest{
+		Model: "Qwen2.5-72B-Instruct",
+		Messages: []Message{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+		MaxTokens:   4096,
+		Temperature: 0.7,
+		TopP:        0.95,
+		Stream:      false,
+	}
+
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: llmTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var llmResp LLMResponse
+	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if len(llmResp.Choices) == 0 || llmResp.Choices[0].Message.Content == "" {
+		return nil, fmt.Errorf("no valid content in response")
+	}
+
+	content := llmResp.Choices[0].Message.Content
+
+	// Extract JSON using regex if needed
+	re := regexp.MustCompile(`\{(?:[^{}]|(?:\{[^{}]*\}))*\}`)
+	match := re.FindString(content)
+	if match == "" {
+		return nil, fmt.Errorf("no valid JSON found in response")
+	}
+
+	var conversation ConversationData
+	if err := json.Unmarshal([]byte(match), &conversation); err != nil {
+		return nil, fmt.Errorf("failed to parse conversation JSON: %w", err)
+	}
+
+	// Validate conversation structure
+	if len(conversation.Conversation) == 0 {
+		return nil, fmt.Errorf("parsed JSON contains no conversation entries")
+	}
+
+	return &conversation, nil
+}
+
+func generatePodcastConversation(ctx context.Context, text string) (string, error) {
+	conversation, err := extractConversation(ctx, text, 3)
+	if err != nil {
+		return "", fmt.Errorf("failed to extract conversation: %w", err)
+	}
+
+	// Convert back to JSON string
+	result, err := json.MarshalIndent(conversation, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal conversation: %w", err)
+	}
+
+	// Removed Redis caching logic for conversation
+	/*
+		if redisConnected {
+			err = rdb.Set(ctx, conversationCacheKey, result, cacheDuration).Err()
+			if err != nil {
+				logger.Warn("Failed to cache conversation", "key", conversationCacheKey, "error", err)
+			} else {
+				logger.Info("Successfully cached new conversation")
+			}
+		}
+	*/
+
+	return string(result), nil
+}
+
+func generateaudiopodcast(ctx context.Context, text string) ([]byte, error) {
+	// Parse the conversation JSON
+	var conversation ConversationData
+	if err := json.Unmarshal([]byte(text), &conversation); err != nil {
+		return nil, fmt.Errorf("failed to parse conversation: %w", err)
+	}
+
+	apiKey := os.Getenv("DEEPINFRA_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("DEEPINFRA_API_KEY environment variable is not set")
+	}
+
+	url := "https://api.deepinfra.com/v1/openai/audio/speech"
+
+	// Create a buffer to store the audio data
+	var audioBuffer bytes.Buffer
+
+	// Process each dialogue entry
+	for _, entry := range conversation.Conversation {
+		voice := "af_bella"
+		if entry.Speaker == "Jenny" {
+			voice = "af_bella"
+		} else if entry.Speaker == "Brian" {
+			voice = "am_michael"
+		}
+
+		// Prepare request body
+		requestBody := map[string]interface{}{
+			"model":           "hexgrad/Kokoro-82M",
+			"input":           entry.Text,
+			"voice":           voice,
+			"response_format": "mp3",
+		}
+
+		jsonBody, err := json.Marshal(requestBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal request body: %w", err)
+		}
+
+		// Create request
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		// Set headers
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+
+		// Make request
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		// Check response status
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		// Write the audio data to buffer
+		_, err = io.Copy(&audioBuffer, resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to write audio data: %w", err)
+		}
+	}
+
+	return audioBuffer.Bytes(), nil
+}
+
+// Helper function to calculate seconds until next 6 AM UTC
+func calculateSecondsUntilNext6AMUTC() int64 {
+	nowUTC := time.Now().UTC()
+	next6AMUTC := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), 6, 0, 0, 0, time.UTC)
+
+	if nowUTC.After(next6AMUTC) {
+		// If current time is past 6 AM today, the next 6 AM is tomorrow
+		next6AMUTC = next6AMUTC.Add(24 * time.Hour)
+	}
+
+	durationUntilNext6AM := next6AMUTC.Sub(nowUTC)
+	seconds := int64(durationUntilNext6AM.Seconds())
+
+	// Ensure minimum cache duration (e.g., 1 minute) if calculation is very close to 6 AM
+	if seconds < 60 {
+		return 60
+	}
+	return seconds
+}
+
 // Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Initialize Redis on first request (using background context for initialization)
-	initOnce.Do(func() {
-		initRedis()
-	})
-
 	// Get the request context
 	reqCtx := r.Context()
 
 	// Remove trailing slash and normalize path
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	if path == "" {
-		path = "/api"  // Normalize empty path to /api
+		path = "/api" // Normalize empty path to /api
 	}
 
 	// Get the full request URL for self-referential links
@@ -744,68 +850,108 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			healthStatus := map[string]interface{}{
 				"status":       "ok",
-				"endpoints":    []string{"/api/feed", "/api/summary"},
-				"cache_status": redisConnected,
+				"endpoints":    []string{"/api/feed", "/api/summary", "/api/conversation", "/api/podcast"},
 				"timestamp":    time.Now().UTC().Format(time.RFC3339),
-				"version":      "1.0.0",
+				"version":      "1.1.0",
 			}
-			
+
 			if err := json.NewEncoder(w).Encode(healthStatus); err != nil {
 				http.Error(w, "Error encoding response", http.StatusInternalServerError)
 			}
 			return
 
 		case "/api/feed":
-			// Pass request context to feed retrieval/generation
-			feed, err := getCachedFeed(reqCtx, requestURL)
+			// Directly generate feed
+			feed, err := generateFeed(reqCtx, requestURL)
 			if err != nil {
-				logger.Error("Failed to get cached feed", "error", err)
+				logger.Error("Failed to generate feed", "error", err)
 				http.Error(w, "Error generating feed", http.StatusInternalServerError)
 				return
 			}
 
+			// Set Vercel Edge Cache headers
+			secondsToCache := calculateSecondsUntilNext6AMUTC()
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
 			w.Header().Set("Content-Type", "application/rss+xml")
 			w.Write(feed)
 			return
-			
+
 		case "/api/summary":
-			// Pass request context to summary retrieval/generation
-			summary, err := getCachedSummary(reqCtx, requestURL)
+			// Directly generate summary
+			summary, err := generateSummary(reqCtx, requestURL)
 			if err != nil {
-				logger.Error("Failed to get cached summary", "error", err)
+				logger.Error("Failed to generate summary", "error", err)
 				http.Error(w, fmt.Sprintf("Error generating summary: %v", err), http.StatusInternalServerError)
 				return
 			}
 
+			// Set Vercel Edge Cache headers
+			secondsToCache := calculateSecondsUntilNext6AMUTC()
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
 			w.Header().Set("Content-Type", "application/rss+xml")
 			w.Write(summary)
 			return
 
-		case "/api/update-cache":
-			// Check for secret key to prevent unauthorized updates
-			secretKey := r.Header.Get("X-Update-Key")
-			expectedKey := os.Getenv("UPDATE_KEY")
-			
-			if expectedKey == "" || secretKey != expectedKey {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		case "/api/conversation":
+			// Get summary first (which will now be generated directly if not edge-cached)
+			summaryBytes, err := generateSummary(reqCtx, requestURL)
+			if err != nil {
+				logger.Error("Failed to generate summary for conversation", "error", err)
+				http.Error(w, fmt.Sprintf("Error generating summary for conversation: %v", err), http.StatusInternalServerError)
 				return
 			}
 
-			// Use request context for the update process.
-			// Consider background context if updates are long-running & shouldn't be tied to client connection.
-			err := updateAllCaches(reqCtx)
+			// Generate podcast conversation directly
+			conversation, err := generatePodcastConversation(reqCtx, string(summaryBytes))
 			if err != nil {
-				// Use a more specific error message if possible
-				logger.Error("Failed to update caches via API", "error", err)
-				http.Error(w, fmt.Sprintf("Error updating caches: %v", err), http.StatusInternalServerError)
+				logger.Error("Failed to generate podcast conversation", "error", err)
+				http.Error(w, fmt.Sprintf("Error generating podcast conversation: %v", err), http.StatusInternalServerError)
 				return
 			}
-			
+
+			// Set Vercel Edge Cache headers
+			secondsToCache := calculateSecondsUntilNext6AMUTC()
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{
-				"status":    "Cache updated successfully",
-				"timestamp": time.Now().UTC().Format(time.RFC3339),
-			})
+			w.Write([]byte(conversation))
+			return
+
+		case "/api/podcast":
+			// Get summary first
+			summaryBytes, err := generateSummary(reqCtx, requestURL)
+			if err != nil {
+				logger.Error("Failed to generate summary for podcast", "error", err)
+				http.Error(w, fmt.Sprintf("Error generating summary for podcast: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Generate conversation directly (needed for audio generation)
+			conversation, err := generatePodcastConversation(reqCtx, string(summaryBytes))
+			if err != nil {
+				logger.Error("Failed to generate conversation for podcast", "error", err)
+				http.Error(w, fmt.Sprintf("Error generating conversation for podcast: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Generate audio podcast directly
+			audioData, err := generateaudiopodcast(reqCtx, conversation)
+			if err != nil {
+				logger.Error("Failed to generate podcast audio", "error", err)
+				http.Error(w, fmt.Sprintf("Error generating podcast audio: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Set Vercel Edge Cache headers
+			secondsToCache := calculateSecondsUntilNext6AMUTC()
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=0, s-maxage=%d", secondsToCache))
+			w.Header().Set("Content-Type", "audio/mpeg")
+			w.Header().Set("Content-Disposition", "inline; filename=\"daily-papers-podcast.mp3\"")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
+			w.Header().Set("Accept-Ranges", "bytes")
+
+			if _, err := w.Write(audioData); err != nil {
+				logger.Error("Failed to write audio response", "error", err)
+			}
 			return
 
 		default:
