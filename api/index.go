@@ -1,13 +1,11 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/joho/godotenv"
+	openai "github.com/openai/openai-go"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
 )
@@ -532,19 +532,20 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 		markdown.WriteString("---\n\n")
 	}
 
-	// logger.Info("Markdown Generated", "markdown", markdown.String())
+	logger.Info("Generated markdown for LLM", "markdown", markdown.String())
+
 	return markdown.String(), nil
 }
 
-// summarizeWithLLM summarizes the markdown content using Hugging Face Router API
-// It now accepts a context for cancellation and timeout, and uses an HTTP client with a timeout.
+// summarizeWithLLM summarizes the markdown content using the OpenAI API
+// It now accepts a context for cancellation and timeout.
 func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
-	apiURL := "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-72B-Instruct/v1/chat/completions"
-	apiKey := os.Getenv("HF_API_KEY")
-	
-	if apiKey == "" {
-		return "", fmt.Errorf("HF_API_KEY environment variable is not set")
+	openaiAPIKey := os.Getenv("OPENAI_API_KEY")
+	if openaiAPIKey == "" {
+		return "", fmt.Errorf("OPENAI_API_KEY environment variable is not set")
 	}
+
+	client := openai.NewClient()
 
 	prompt := `Create a brief morning briefing on these AI research papers, written in a conversational style for busy professionals. Focus on what's new and what it means for businesses and society.
 Format the output in HTML:
@@ -560,86 +561,44 @@ Format the output in HTML:
   <li>Keep the tone light and engaging</li>
 </ul>
 
-Keep it under 200 words. Start with the most impressive or important paper. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.
+Start with the most impressive or important paper. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.
 
 Do not enclose the HTML in a markdown code block, just return the HTML.
 
 Below are the paper abstracts and information in markdown format:
 ` + markdownContent
 
-	request := LLMRequest{
-		Model: "Qwen/Qwen2.5-72B-Instruct",
-		Messages: []Message{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
+	params := openai.ChatCompletionNewParams{
+		Model: openai.ChatModelGPT4oMini, // Use desired OpenAI model
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.UserMessage(prompt),
 		},
-		MaxTokens:          4096,
-		Stream:             false,
-		StreamOptions: struct {
-			IncludeUsage bool `json:"include_usage"`
-		}{
-			IncludeUsage: true,
-		},
-		Temperature:        0.6,
-		TopP:              0.95,
-		SeparateReasoning:  true,
+		MaxTokens:   openai.Int(4096),
+		Temperature: openai.Float(0.6),
+		TopP:        openai.Float(0.95),
 	}
 
-	requestBody, err := json.Marshal(request)
+	// Use the provided context for the API call
+	completion, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal LLM request: %w", err)
-	}
-
-	// Create request with context
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(requestBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create LLM request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	// Create an HTTP client with the LLM timeout
-	client := &http.Client{
-		Timeout: llmTimeout,
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", fmt.Errorf("timeout calling Hugging Face Router API: %w", err)
+		var openaiErr *openai.Error
+		if errors.As(err, &openaiErr) {
+			logger.Error("OpenAI API error", "status_code", openaiErr.StatusCode, "type", openaiErr.Type, "code", openaiErr.Code, "param", openaiErr.Param, "message", openaiErr.Message)
+			return "", fmt.Errorf("OpenAI API error (%d %s): %s", openaiErr.StatusCode, openaiErr.Code, openaiErr.Message)
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			return "", fmt.Errorf("timeout calling OpenAI API: %w", err)
 		}
-		return "", fmt.Errorf("failed to send request to Hugging Face Router API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP error %d from Hugging Face Router API: %s", resp.StatusCode, string(bodyBytes))
+		return "", fmt.Errorf("failed to call OpenAI API: %w", err)
 	}
 
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return "", fmt.Errorf("failed to decode LLM response: %w", err)
+	if len(completion.Choices) == 0 || completion.Choices[0].Message.Content == "" {
+		logger.Warn("OpenAI response contained no choices or empty content", "response_id", completion.ID)
+		return "", fmt.Errorf("no valid response content returned from OpenAI API")
 	}
 
-	if len(llmResp.Choices) == 0 || llmResp.Choices[0].Message.Content == "" {
-		logger.Warn("LLM response contained no choices or empty content", "response", llmResp)
-		return "", fmt.Errorf("no valid response content returned from Hugging Face Router API")
-	}
+	responseContent := completion.Choices[0].Message.Content
 
-	response := llmResp.Choices[0].Message.Content
-
-	// Extract only the content after <think> tags if present
-	if strings.Contains(response, "<think>") {
-		parts := strings.Split(response, "</think>")
-		if len(parts) > 1 {
-			response = strings.TrimSpace(parts[len(parts)-1])
-		}
-	}
-
-	return response, nil
+	return responseContent, nil
 }
 
 func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
@@ -751,6 +710,12 @@ func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, erro
 
 // Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// Load .env file. Ignore error if file doesn't exist.
+	err := godotenv.Load()
+	if err != nil {
+		logger.Warn("Error loading .env file, using system environment variables", "error", err)
+	}
+
 	// Initialize Redis on first request (using background context for initialization)
 	initOnce.Do(func() {
 		initRedis()
