@@ -200,12 +200,12 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 	client := &http.Client{
 		Timeout: scrapeTimeout,
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request for %s: %w", baseURL, err)
 	}
-	
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -218,32 +218,56 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to fetch papers from %s: status code %d", baseURL, resp.StatusCode)
 	}
-	
+
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse HTML from %s: %w", baseURL, err)
 	}
 
 	var papers []Paper
+	var findPaperDetails func(*html.Node) (title string, href string, found bool)
 
-	var crawler func(*html.Node)
-	crawler = func(node *html.Node) {
+	// Helper function to find the h3 > a within an article
+	findPaperDetails = func(node *html.Node) (string, string, bool) {
 		if node.Type == html.ElementNode && node.Data == "h3" {
-			var title, href string
 			for c := node.FirstChild; c != nil; c = c.NextSibling {
 				if c.Type == html.ElementNode && c.Data == "a" {
+					var href string
 					for _, attr := range c.Attr {
 						if attr.Key == "href" {
 							href = attr.Val
 						}
 					}
-					title = extractText(c)
-					break
+					title := extractText(c)
+					if href != "" && title != "" {
+						return title, href, true
+					}
 				}
 			}
+		}
+		// Recursively search children
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			if title, href, found := findPaperDetails(c); found {
+				return title, href, true
+			}
+		}
+		return "", "", false
+	}
+
+
+	var crawler func(*html.Node)
+	crawler = func(node *html.Node) {
+		// Target the <article> tag for each paper
+		if node.Type == html.ElementNode && node.Data == "article" {
 			
-			if href != "" {
+			// Find the title and href within the article
+			title, href, found := findPaperDetails(node)
+
+			if found {
 				url := fmt.Sprintf("https://huggingface.co%s", href)
+				// Scrape abstract using the existing function
+				// Note: The abstract page structure might also have changed.
+				// This might need adjustment if abstract scraping fails.
 				abstract, err := scrapeAbstract(ctx, url)
 				if err != nil {
 					logger.Error("Failed to extract abstract", "url", url, "error", err)
@@ -254,11 +278,19 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 					Title:    strings.TrimSpace(title),
 					URL:      url,
 					Abstract: abstract,
-					PubDate:  time.Now().UTC(),
+					PubDate:  time.Now().UTC(), // Consider parsing date if available in new structure
 				})
+			} else {
+				// Log if details couldn't be found within an article element
+				logger.Warn("Could not find paper details (h3 > a) within article element")
 			}
 		}
+		
+		// Continue crawling siblings and children
+		// Check NextSibling first before FirstChild to avoid redundant crawls within found articles
+		// (though findPaperDetails already handles recursion within the article)
 		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			// Optimization: Limit recursion depth or check node type if performance becomes an issue
 			crawler(c)
 		}
 	}
