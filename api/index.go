@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -502,7 +503,7 @@ func updateAllCaches(ctx context.Context) error {
 
 	// 5. Generate summary RSS
 	// Use baseURL for the canonical requestURL
-	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL)
+	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL, markdown)
 	if err != nil {
 		// If summary RSS generation fails, log and return error.
 		logger.Error("Failed to generate summary RSS for cache update", "error", err)
@@ -685,14 +686,60 @@ Below are the paper abstracts and information in markdown format:
 	return markdownSummary, nil
 }
 
-func generateSummaryRSS(summaryMarkdown string, requestURL string) ([]byte, error) {
+// extractLinksFromMarkdown parses the input markdown to find ## [Title](URL) lines
+// and returns a map of title -> URL.
+func extractLinksFromMarkdown(markdownContent string) map[string]string {
+	links := make(map[string]string)
+	// Regex to find lines like ## [Title](URL)
+	// It captures the title (group 1) and the URL (group 2)
+	re := regexp.MustCompile(`(?m)^##\s*\[([^\]]+)\]\(([^)]+)\)$`)
+	matches := re.FindAllStringSubmatch(markdownContent, -1)
+	for _, match := range matches {
+		if len(match) == 3 {
+			title := strings.TrimSpace(match[1])
+			url := strings.TrimSpace(match[2])
+			links[title] = url
+			logger.Debug("Extracted link", "title", title, "url", url) // Optional: Debug log
+		}
+	}
+	return links
+}
+
+// replacePlaceholdersWithLinks replaces placeholders like [Title] in the summary
+// with actual markdown links using the provided title-URL map.
+func replacePlaceholdersWithLinks(summaryMarkdown string, links map[string]string) string {
+	// Regex to find placeholders like [Title]
+	re := regexp.MustCompile(`\[([^\]]+)\]`)
+	
+	replacedMarkdown := re.ReplaceAllStringFunc(summaryMarkdown, func(match string) string {
+		// Extract the title from the match (e.g., "[Title]" -> "Title")
+		title := strings.Trim(match, "[]")
+		// Look up the URL in the map
+		if url, ok := links[title]; ok {
+			// If found, return the proper markdown link
+			return fmt.Sprintf("[%s](%s)", title, url)
+		}
+		// If not found, return the original placeholder unchanged
+		return match
+	})
+	
+	return replacedMarkdown
+}
+
+func generateSummaryRSS(summaryMarkdown string, requestURL string, originalMarkdown string) ([]byte, error) {
 	now := time.Now().UTC()
 
-	// Convert markdown to HTML
-	htmlBytes := md.ToHTML([]byte(summaryMarkdown), nil, nil)
+	// 1. Extract links from the original markdown
+	paperLinks := extractLinksFromMarkdown(originalMarkdown)
+
+	// 2. Replace placeholders in the summary markdown with actual links
+	linkedSummaryMarkdown := replacePlaceholdersWithLinks(summaryMarkdown, paperLinks)
+
+	// 3. Convert the link-replaced markdown to HTML
+	htmlBytes := md.ToHTML([]byte(linkedSummaryMarkdown), nil, nil)
 	htmlSummary := string(htmlBytes)
 
-	// Wrap the HTML summary in a single div and place it in CDATA
+	// 4. Wrap the HTML summary in a single div and place it in CDATA
 	wrappedHtmlSummary := fmt.Sprintf("<div>%s</div>", htmlSummary)
 
 	item := Item{
@@ -781,19 +828,19 @@ func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, erro
 	}
 	
 	// Convert feed to markdown (no context needed for this part)
-	markdown, err := parseRSSToMarkdown(string(feedBytes))
+	originalMarkdown, err := parseRSSToMarkdown(string(feedBytes))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse RSS to markdown for summary generation: %w", err)
+		return nil, fmt.Errorf("failed to parse RSS to originalMarkdown for summary generation: %w", err)
 	}
 	
 	// Summarize with LLM, passing context
-	summaryContent, err := summarizeWithLLM(ctx, markdown)
+	summaryMarkdown, err := summarizeWithLLM(ctx, originalMarkdown)
 	if err != nil {
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
 	
 	// Use the original requestURL for the summary RSS self-link
-	return generateSummaryRSS(summaryContent, requestURL)
+	return generateSummaryRSS(summaryMarkdown, requestURL, originalMarkdown)
 }
 
 // Handler handles all requests
