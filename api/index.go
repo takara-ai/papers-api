@@ -692,11 +692,13 @@ func generateSummaryRSS(summaryMarkdown string, requestURL string) ([]byte, erro
 	htmlBytes := md.ToHTML([]byte(summaryMarkdown), nil, nil)
 	htmlSummary := string(htmlBytes)
 
-	// The summary is now HTML, place it directly in CDATA
+	// Wrap the HTML summary in a single div and place it in CDATA
+	wrappedHtmlSummary := fmt.Sprintf("<div>%s</div>", htmlSummary)
+
 	item := Item{
 		Title:       "AI Research Papers Summary for " + now.Format("January 2, 2006"),
 		Link:        liveURL,
-		Description: CDATA{Text: htmlSummary}, // Use HTML summary
+		Description: CDATA{Text: wrappedHtmlSummary}, // Use div-wrapped HTML summary
 		PubDate:     now.Format(time.RFC1123Z),
 		GUID: GUID{
 			IsPermaLink: false,
