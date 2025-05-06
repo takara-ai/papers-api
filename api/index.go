@@ -20,6 +20,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
+	"github.com/gomarkdown/markdown/parser"
+	"github.com/gomarkdown/markdown/ast"
 )
 
 const (
@@ -494,7 +496,7 @@ func updateAllCaches(ctx context.Context) error {
 	// Use a context with appropriate timeout for the LLM call
 	summaryCtx, cancel := context.WithTimeout(ctx, llmTimeout)
 	defer cancel()
-	summaryContent, err := summarizeWithLLM(summaryCtx, markdown)
+	summaryContent, err := summarizeWithLLM(summaryCtx, markdown, extractLinksFromMarkdown(markdown))
 	if err != nil {
 		// If LLM fails, log and return error.
 		logger.Error("Failed to summarize markdown with LLM for cache update", "error", err)
@@ -564,10 +566,360 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 	return markdown.String(), nil
 }
 
+// ValidationSeverity represents the severity level of a validation issue
+type ValidationSeverity int
+
+const (
+	SeverityWarning ValidationSeverity = iota
+	SeverityError
+)
+
+// ValidationError represents a validation error with details and severity
+type ValidationError struct {
+	Field    string
+	Message  string
+	Details  string
+	Severity ValidationSeverity
+}
+
+func (e ValidationError) Error() string {
+	return fmt.Sprintf("validation %s in %s: %s", e.severityString(), e.Field, e.Message)
+}
+
+func (e ValidationError) severityString() string {
+	if e.Severity == SeverityWarning {
+		return "warning"
+	}
+	return "error"
+}
+
+// validateMarkdownStructure checks if the markdown has the required sections and structure
+func validateMarkdownStructure(markdown string) error {
+	// Create markdown parser with extensions
+	extensions := parser.CommonExtensions | parser.AutoHeadingIDs
+	p := parser.NewWithExtensions(extensions)
+	
+	// Parse the markdown into an AST
+	doc := p.Parse([]byte(markdown))
+	
+	foundSections := make(map[string]bool)
+	var headlineText string
+	var collectingHeadlineContent bool
+	var currentSectionTextBuilder strings.Builder
+	
+	ast.WalkFunc(doc, func(node ast.Node, entering bool) ast.WalkStatus {
+		if h, ok := node.(*ast.Heading); ok && h.Level == 2 {
+			if entering {
+				// If we were collecting for Morning Headline and hit a new H2, finalize.
+				if collectingHeadlineContent {
+					headlineText = strings.TrimSpace(currentSectionTextBuilder.String())
+					collectingHeadlineContent = false // Stop collecting
+				}
+
+				var currentHeadingTitle string
+				for _, child := range h.Children {
+					if t, ok := child.(*ast.Text); ok {
+						currentHeadingTitle += string(t.Literal)
+					}
+				}
+				currentHeadingTitle = strings.TrimSpace(currentHeadingTitle)
+				foundSections[currentHeadingTitle] = true // Mark this H2 section as found
+
+				if currentHeadingTitle == "Morning Headline" {
+					collectingHeadlineContent = true
+					currentSectionTextBuilder.Reset() // Reset builder for Morning Headline content
+				}
+			}
+			return ast.GoToNext // Continue to process children of heading if any, then move on
+		}
+
+		// If we are collecting content for the "Morning Headline"
+		if collectingHeadlineContent && entering {
+			if para, ok := node.(*ast.Paragraph); ok {
+				var paragraphContent strings.Builder
+				for _, child := range para.Children {
+					if t, ok := child.(*ast.Text); ok {
+						paragraphContent.WriteString(string(t.Literal))
+					} else if l, ok := child.(*ast.Link); ok {
+						// If we want link text in the headline, extract it
+						for _, linkChild := range l.Children {
+							if lt, ok := linkChild.(*ast.Text); ok {
+								paragraphContent.WriteString(string(lt.Literal))
+							}
+						}
+					}
+					// Can add more inline types like Emphasis, Strong if needed
+				}
+				// Append paragraph content to the headline builder
+				if currentSectionTextBuilder.Len() > 0 {
+					currentSectionTextBuilder.WriteString(" ") // Add space between paragraphs
+				}
+				currentSectionTextBuilder.WriteString(paragraphContent.String())
+			}
+		}
+		return ast.GoToNext
+	})
+
+	// After the walk, if still collecting (Morning Headline was the last section)
+	if collectingHeadlineContent {
+		headlineText = strings.TrimSpace(currentSectionTextBuilder.String())
+	}
+	
+	// Check for required sections
+	requiredSections := []string{"Morning Headline", "What's New"}
+	for _, section := range requiredSections {
+		if !foundSections[section] {
+			logger.Error("Missing required section",
+				"section", section,
+				"found_sections", foundSections)
+			return ValidationError{
+				Field:    "structure",
+				Message:  fmt.Sprintf("missing required section: %s", section),
+				Details:  markdown,
+				Severity: SeverityError,
+			}
+		}
+	}
+	
+	// Validate headline content
+	if headlineText == "" {
+		logger.Error("Empty headline content", "details", "Extracted headline string was empty after AST parsing and trimming.")
+		return ValidationError{
+			Field:    "headline",
+			Message:  "headline content is empty",
+			Details:  markdown, // Full markdown for context
+			Severity: SeverityError,
+		}
+	}
+	
+	// Clean up the headline text (collapse multiple spaces to one)
+	headlineText = regexp.MustCompile(`\s+`).ReplaceAllString(headlineText, " ")
+	
+	// Check headline length
+	if len(headlineText) > 200 {
+		logger.Error("Headline too long",
+			"headline", headlineText,
+			"length", len(headlineText))
+		return ValidationError{
+			Field:    "headline",
+			Message:  fmt.Sprintf("headline too long: %d characters (limit 200)", len(headlineText)),
+			Details:  headlineText,
+			Severity: SeverityError,
+		}
+	}
+	
+	logger.Debug("Markdown structure validation successful",
+		"headline", headlineText,
+		"headline_length", len(headlineText))
+	
+	return nil
+}
+
+// Helper function to get minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// normalizeURL standardizes URL format for comparison
+func normalizeURL(url string) string {
+	original := url
+	// Remove trailing slashes
+	url = strings.TrimSuffix(url, "/")
+	// Convert to lowercase
+	url = strings.ToLower(url)
+	// Remove any query parameters
+	if idx := strings.Index(url, "?"); idx != -1 {
+		url = url[:idx]
+	}
+	// Remove any hash fragments
+	if idx := strings.Index(url, "#"); idx != -1 {
+		url = url[:idx]
+	}
+	// Remove any double slashes (except after protocol)
+	url = regexp.MustCompile(`([^:])//+`).ReplaceAllString(url, "$1/")
+	
+	logger.Debug("URL normalization",
+		"original", original,
+		"normalized", url)
+	return url
+}
+
+// validateMarkdownLinks checks if all markdown links are properly formatted and contain URLs
+func validateMarkdownLinks(markdown string, feedURLs map[string]string) error {
+	// Create normalized feed URLs map
+	normalizedFeedURLs := make(map[string]string)
+	for url := range feedURLs {
+		normalized := normalizeURL(url)
+		normalizedFeedURLs[normalized] = url
+	}
+
+	// Regex to find markdown links: [text](url)
+	linkRegex := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	matches := linkRegex.FindAllStringSubmatch(markdown, -1)
+
+	if len(matches) == 0 {
+		return ValidationError{
+			Field:    "links",
+			Message:  "no markdown links found in summary",
+			Details:  markdown,
+			Severity: SeverityError,
+		}
+	}
+
+	var warnings []string
+	var errors []string
+
+	for _, match := range matches {
+		if len(match) != 3 {
+			continue
+		}
+		text := match[1]
+		url := match[2]
+
+		// Validate URL format
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			errors = append(errors, fmt.Sprintf("%s: %s (invalid protocol)", text, url))
+			continue
+		}
+
+		// Normalize URL for comparison
+		normalizedURL := normalizeURL(url)
+		
+		// Check if normalized URL exists in feed
+		if _, exists := normalizedFeedURLs[normalizedURL]; !exists {
+			warnings = append(warnings, fmt.Sprintf("%s: %s (not in feed)", text, url))
+			continue
+		}
+	}
+
+	// Log warnings but don't fail validation
+	if len(warnings) > 0 {
+		logger.Warn("Link validation warnings",
+			"warnings", warnings,
+			"markdown", markdown)
+	}
+
+	// Return error if there are any critical issues
+	if len(errors) > 0 {
+		return ValidationError{
+			Field:    "links",
+			Message:  fmt.Sprintf("found %d invalid URLs", len(errors)),
+			Details:  fmt.Sprintf("invalid URLs: %v", errors),
+			Severity: SeverityError,
+		}
+	}
+
+	return nil
+}
+
+// validateSummaryLength checks if the summary is within reasonable bounds
+func validateSummaryLength(markdown string) error {
+	// Remove markdown links for word count
+	plainText := regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).ReplaceAllString(markdown, "$1")
+	words := strings.Fields(plainText)
+	
+	if len(words) > 1000 {
+		return ValidationError{
+			Field:    "length",
+			Message:  fmt.Sprintf("summary too long: %d words", len(words)),
+			Details:  fmt.Sprintf("max allowed: 1000, current: %d", len(words)),
+			Severity: SeverityError,
+		}
+	}
+
+	if len(words) < 50 {
+		return ValidationError{
+			Field:    "length",
+			Message:  fmt.Sprintf("summary too short: %d words", len(words)),
+			Details:  fmt.Sprintf("min expected: 50, current: %d", len(words)),
+			Severity: SeverityError,
+		}
+	}
+
+	// Log warning if summary is getting close to the limit
+	if len(words) > 800 {
+		logger.Warn("Summary approaching length limit",
+			"word_count", len(words),
+			"max_allowed", 1000)
+	}
+
+	return nil
+}
+
+// validateSummaryContent performs all validations on the summary in parallel
+func validateSummaryContent(markdown string, feedURLs map[string]string) error {
+	// Create channels for validation results
+	errChan := make(chan error, 3)
+	var wg sync.WaitGroup
+
+	// Run validations in parallel
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		if err := validateMarkdownStructure(markdown); err != nil {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := validateMarkdownLinks(markdown, feedURLs); err != nil {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := validateSummaryLength(markdown); err != nil {
+			errChan <- err
+		}
+	}()
+
+	// Wait for all validations to complete
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	// Collect errors
+	var errors []error
+	var warnings []error
+	for err := range errChan {
+		if err != nil {
+			if validationErr, ok := err.(ValidationError); ok {
+				if validationErr.Severity == SeverityWarning {
+					warnings = append(warnings, err)
+				} else {
+					errors = append(errors, err)
+				}
+			} else {
+				errors = append(errors, err)
+			}
+		}
+	}
+
+	// Log warnings
+	for _, warning := range warnings {
+		logger.Warn("Summary validation warning",
+			"warning", warning,
+			"markdown", markdown)
+	}
+
+	// Return first error if any exist
+	if len(errors) > 0 {
+		return fmt.Errorf("validation failed: %v", errors)
+	}
+
+	return nil
+}
+
 // summarizeWithLLM summarizes the markdown content using the OpenAI API
-func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
+func summarizeWithLLM(ctx context.Context, markdownContent string, feedURLs map[string]string) (string, error) {
 	apiURL := "https://api.openai.com/v1/responses"
-	apiKey := os.Getenv("OPENAI_API_KEY") // Use OpenAI key
+	apiKey := os.Getenv("OPENAI_API_KEY")
 
 	if apiKey == "" {
 		return "", fmt.Errorf("OPENAI_API_KEY environment variable is not set")
@@ -657,7 +1009,7 @@ Below are the paper abstracts and information in markdown format:
 	}
 
 	// Log the raw response body for debugging
-	logger.Info("Raw OpenAI API Response Body", "status_code", resp.StatusCode, "body", string(bodyBytes))
+	// logger.Info("Raw OpenAI API Response Body", "status_code", resp.StatusCode, "body", string(bodyBytes))
 
 	if resp.StatusCode != http.StatusOK {
 		// We already logged the body, just return the error
@@ -679,10 +1031,21 @@ Below are the paper abstracts and information in markdown format:
 		return "", fmt.Errorf("invalid or empty response structure from OpenAI API")
 	}
 
-	// Return the markdown text directly from the nested path
+	// Extract the markdown text directly from the nested path
 	markdownSummary := openAIResp.Output[0].Content[0].Text
 
-	// No need to process <think> tags like before, assuming OpenAI response format is consistent
+	// Validate the summary content
+	if err := validateSummaryContent(markdownSummary, feedURLs); err != nil {
+		logger.Error("LLM summary validation failed",
+			"error", err,
+			"summary", markdownSummary)
+		return "", fmt.Errorf("LLM summary validation failed: %w", err)
+	}
+
+	logger.Info("Successfully validated LLM summary",
+		"summary_length", len(markdownSummary),
+		"link_count", len(regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).FindAllString(markdownSummary, -1)))
+
 	return markdownSummary, nil
 }
 
@@ -821,20 +1184,22 @@ func getCachedSummary(ctx context.Context, requestURL string) ([]byte, error) {
 // It now accepts a context to pass down the call chain.
 func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, error) {
 	// Get the feed content, passing context
-	// This now correctly uses the feed cache if available, or generates directly.
 	feedBytes, err := getCachedFeed(ctx, requestURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
 	
-	// Convert feed to markdown (no context needed for this part)
+	// Convert feed to markdown
 	originalMarkdown, err := parseRSSToMarkdown(string(feedBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RSS to originalMarkdown for summary generation: %w", err)
 	}
+
+	// Extract URLs from feed for validation
+	feedURLs := extractLinksFromMarkdown(originalMarkdown)
 	
 	// Summarize with LLM, passing context
-	summaryMarkdown, err := summarizeWithLLM(ctx, originalMarkdown)
+	summaryMarkdown, err := summarizeWithLLM(ctx, originalMarkdown, feedURLs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
