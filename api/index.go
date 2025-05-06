@@ -579,7 +579,7 @@ Format the output in markdown:
 ## Morning Headline
 (1 sentence)
 ## What's New 
-(2-3 sentences, written like you're explaining it to a friend over coffee, with citations to papers as markdown link [Paper Name])
+(2-3 sentences, written like you're explaining it to a friend over coffee, with citations to papers using the full markdown link format: [Paper Title](URL))
 
  - Cover all papers in a natural, flowing narrative
  - Group related papers together
