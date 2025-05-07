@@ -1,12 +1,14 @@
 module hf-papers-rss
 
-go 1.23
+go 1.23.0
 
 toolchain go1.23.4
 
 require (
+	github.com/gomarkdown/markdown v0.0.0-20250311123330-531bef5e742b
+	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.7.0
-	golang.org/x/net v0.32.0
+	golang.org/x/net v0.39.0
 )
 
 require (

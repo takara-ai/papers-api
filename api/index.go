@@ -11,12 +11,17 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	md "github.com/gomarkdown/markdown" // Import markdown library
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
+	"github.com/gomarkdown/markdown/parser"
+	"github.com/gomarkdown/markdown/ast"
 )
 
 const (
@@ -77,45 +82,58 @@ type CDATA struct {
 	Text string `xml:",cdata"`
 }
 
-// LLM API structures
-type LLMRequest struct {
-	Model               string    `json:"model"`
-	Messages            []Message `json:"messages"`
-	MaxTokens           int       `json:"max_tokens"`
-	Stream              bool      `json:"stream"`
-	StreamOptions       struct {
-		IncludeUsage bool `json:"include_usage"`
-	} `json:"stream_options"`
-	Temperature         float64 `json:"temperature"`
-	TopP               float64 `json:"top_p"`
-	SeparateReasoning  bool    `json:"separate_reasoning"`
+// OpenAI API structures
+type OpenAIRequest struct {
+	Model          string         `json:"model"`
+	Input          []OpenAIMessage `json:"input"`
+	Text           OpenAIText     `json:"text"`
+	Reasoning      map[string]any `json:"reasoning"` // Empty object for now
+	Tools          []any          `json:"tools"`     // Empty array for now
+	Temperature    float64        `json:"temperature"`
+	MaxOutputTokens int            `json:"max_output_tokens"`
+	TopP           float64        `json:"top_p"`
+	Store          bool           `json:"store"`
 }
 
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Name    string `json:"name,omitempty"`
+type OpenAIMessage struct {
+	Role    string            `json:"role"`
+	Content []OpenAIContentBlock `json:"content"`
 }
 
-type LLMResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created float64 `json:"created"`
-	Model   string `json:"model"`
-	Choices []struct {
-		Index   int `json:"index"`
-		Message struct {
-			Role             string `json:"role"`
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Usage struct {
-		CompletionTokens int `json:"completion_tokens"`
-		PromptTokens     int `json:"prompt_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+type OpenAIContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type OpenAIText struct {
+	Format OpenAIFormat `json:"format"`
+}
+
+type OpenAIFormat struct {
+	Type string `json:"type"`
+}
+
+// OpenAIResponse represents the top-level response object from /v1/responses
+type OpenAIResponse struct {
+	ID     string                `json:"id"`
+	Object string                `json:"object"`
+	Model  string                `json:"model"`
+	Output []OpenAIOutputMessage `json:"output"` // Added Output field
+	// Other top-level fields like status, usage, etc., can be added if needed
+}
+
+// OpenAIOutputMessage represents the message object within the 'output' array
+type OpenAIOutputMessage struct {
+	ID      string              `json:"id"`
+	Type    string              `json:"type"`
+	Role    string              `json:"role"`    // Role is here
+	Content []OpenAIResponseContent `json:"content"` // Content is here
+}
+
+type OpenAIResponseContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+	// Annotations field omitted as it's not needed for extraction
 }
 
 var (
@@ -125,6 +143,17 @@ var (
 	initOnce sync.Once
 	logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 )
+
+func init() {
+	// Load .env file on package initialization
+	err := godotenv.Load()
+	if err != nil {
+		// Log if .env is not found, but don't treat as fatal error
+		// Environment variables might be set directly
+		logger.Info("Error loading .env file (this is expected if using system env vars)", "error", err)
+	}
+	initRedis() // Keep Redis init here as well
+}
 
 func scrapeAbstract(ctx context.Context, url string) (string, error) {
 	client := &http.Client{
@@ -364,7 +393,8 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func initRedis() {
 	redisURL := os.Getenv("KV_URL")
 	if redisURL == "" {
-		return
+		logger.Warn("KV_URL not set, Redis connection skipped")
+		return // Skip Redis connection if URL is not set
 	}
 
 	opt, err := redis.ParseURL(redisURL)
@@ -466,7 +496,7 @@ func updateAllCaches(ctx context.Context) error {
 	// Use a context with appropriate timeout for the LLM call
 	summaryCtx, cancel := context.WithTimeout(ctx, llmTimeout)
 	defer cancel()
-	summaryContent, err := summarizeWithLLM(summaryCtx, markdown)
+	summaryContent, err := summarizeWithLLM(summaryCtx, markdown, extractLinksFromMarkdown(markdown))
 	if err != nil {
 		// If LLM fails, log and return error.
 		logger.Error("Failed to summarize markdown with LLM for cache update", "error", err)
@@ -475,7 +505,7 @@ func updateAllCaches(ctx context.Context) error {
 
 	// 5. Generate summary RSS
 	// Use baseURL for the canonical requestURL
-	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL)
+	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL, markdown)
 	if err != nil {
 		// If summary RSS generation fails, log and return error.
 		logger.Error("Failed to generate summary RSS for cache update", "error", err)
@@ -536,70 +566,424 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 	return markdown.String(), nil
 }
 
-// summarizeWithLLM summarizes the markdown content using Hugging Face Router API
-// It now accepts a context for cancellation and timeout, and uses an HTTP client with a timeout.
-func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
-	apiURL := "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-72B-Instruct/v1/chat/completions"
-	apiKey := os.Getenv("HF_API_KEY")
+// ValidationSeverity represents the severity level of a validation issue
+type ValidationSeverity int
+
+const (
+	SeverityWarning ValidationSeverity = iota
+	SeverityError
+)
+
+// ValidationError represents a validation error with details and severity
+type ValidationError struct {
+	Field    string
+	Message  string
+	Details  string
+	Severity ValidationSeverity
+}
+
+func (e ValidationError) Error() string {
+	return fmt.Sprintf("validation %s in %s: %s", e.severityString(), e.Field, e.Message)
+}
+
+func (e ValidationError) severityString() string {
+	if e.Severity == SeverityWarning {
+		return "warning"
+	}
+	return "error"
+}
+
+// validateMarkdownStructure checks if the markdown has the required sections and structure
+func validateMarkdownStructure(markdown string) error {
+	// Create markdown parser with extensions
+	extensions := parser.CommonExtensions | parser.AutoHeadingIDs
+	p := parser.NewWithExtensions(extensions)
 	
-	if apiKey == "" {
-		return "", fmt.Errorf("HF_API_KEY environment variable is not set")
+	// Parse the markdown into an AST
+	doc := p.Parse([]byte(markdown))
+	
+	foundSections := make(map[string]bool)
+	var headlineText string
+	var collectingHeadlineContent bool
+	var currentSectionTextBuilder strings.Builder
+	
+	ast.WalkFunc(doc, func(node ast.Node, entering bool) ast.WalkStatus {
+		if h, ok := node.(*ast.Heading); ok && h.Level == 2 {
+			if entering {
+				// If we were collecting for Morning Headline and hit a new H2, finalize.
+				if collectingHeadlineContent {
+					headlineText = strings.TrimSpace(currentSectionTextBuilder.String())
+					collectingHeadlineContent = false // Stop collecting
+				}
+
+				var currentHeadingTitle string
+				for _, child := range h.Children {
+					if t, ok := child.(*ast.Text); ok {
+						currentHeadingTitle += string(t.Literal)
+					}
+				}
+				currentHeadingTitle = strings.TrimSpace(currentHeadingTitle)
+				foundSections[currentHeadingTitle] = true // Mark this H2 section as found
+
+				if currentHeadingTitle == "Morning Headline" {
+					collectingHeadlineContent = true
+					currentSectionTextBuilder.Reset() // Reset builder for Morning Headline content
+				}
+			}
+			return ast.GoToNext // Continue to process children of heading if any, then move on
+		}
+
+		// If we are collecting content for the "Morning Headline"
+		if collectingHeadlineContent && entering {
+			if para, ok := node.(*ast.Paragraph); ok {
+				var paragraphContent strings.Builder
+				for _, child := range para.Children {
+					if t, ok := child.(*ast.Text); ok {
+						paragraphContent.WriteString(string(t.Literal))
+					} else if l, ok := child.(*ast.Link); ok {
+						// If we want link text in the headline, extract it
+						for _, linkChild := range l.Children {
+							if lt, ok := linkChild.(*ast.Text); ok {
+								paragraphContent.WriteString(string(lt.Literal))
+							}
+						}
+					}
+					// Can add more inline types like Emphasis, Strong if needed
+				}
+				// Append paragraph content to the headline builder
+				if currentSectionTextBuilder.Len() > 0 {
+					currentSectionTextBuilder.WriteString(" ") // Add space between paragraphs
+				}
+				currentSectionTextBuilder.WriteString(paragraphContent.String())
+			}
+		}
+		return ast.GoToNext
+	})
+
+	// After the walk, if still collecting (Morning Headline was the last section)
+	if collectingHeadlineContent {
+		headlineText = strings.TrimSpace(currentSectionTextBuilder.String())
+	}
+	
+	// Check for required sections
+	requiredSections := []string{"Morning Headline", "What's New"}
+	for _, section := range requiredSections {
+		if !foundSections[section] {
+			logger.Error("Missing required section",
+				"section", section,
+				"found_sections", foundSections)
+			return ValidationError{
+				Field:    "structure",
+				Message:  fmt.Sprintf("missing required section: %s", section),
+				Details:  markdown,
+				Severity: SeverityError,
+			}
+		}
+	}
+	
+	// Validate headline content
+	if headlineText == "" {
+		logger.Error("Empty headline content", "details", "Extracted headline string was empty after AST parsing and trimming.")
+		return ValidationError{
+			Field:    "headline",
+			Message:  "headline content is empty",
+			Details:  markdown, // Full markdown for context
+			Severity: SeverityError,
+		}
+	}
+	
+	// Clean up the headline text (collapse multiple spaces to one)
+	headlineText = regexp.MustCompile(`\s+`).ReplaceAllString(headlineText, " ")
+	
+	// Check headline length
+	if len(headlineText) > 200 {
+		logger.Error("Headline too long",
+			"headline", headlineText,
+			"length", len(headlineText))
+		return ValidationError{
+			Field:    "headline",
+			Message:  fmt.Sprintf("headline too long: %d characters (limit 200)", len(headlineText)),
+			Details:  headlineText,
+			Severity: SeverityError,
+		}
+	}
+	
+	logger.Debug("Markdown structure validation successful",
+		"headline", headlineText,
+		"headline_length", len(headlineText))
+	
+	return nil
+}
+
+// Helper function to get minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// normalizeURL standardizes URL format for comparison
+func normalizeURL(url string) string {
+	original := url
+	// Remove trailing slashes
+	url = strings.TrimSuffix(url, "/")
+	// Convert to lowercase
+	url = strings.ToLower(url)
+	// Remove any query parameters
+	if idx := strings.Index(url, "?"); idx != -1 {
+		url = url[:idx]
+	}
+	// Remove any hash fragments
+	if idx := strings.Index(url, "#"); idx != -1 {
+		url = url[:idx]
+	}
+	// Remove any double slashes (except after protocol)
+	url = regexp.MustCompile(`([^:])//+`).ReplaceAllString(url, "$1/")
+	
+	logger.Debug("URL normalization",
+		"original", original,
+		"normalized", url)
+	return url
+}
+
+// validateMarkdownLinks checks if all markdown links are properly formatted and contain URLs
+func validateMarkdownLinks(markdown string, feedURLs map[string]string) error {
+	// Create normalized feed URLs map
+	normalizedFeedURLs := make(map[string]string)
+	for url := range feedURLs {
+		normalized := normalizeURL(url)
+		normalizedFeedURLs[normalized] = url
 	}
 
-	prompt := `Create a brief morning briefing on these AI research papers, written in a conversational style for busy professionals. Focus on what's new and what it means for businesses and society.
-Format the output in HTML:
-<h2>Morning Headline</h2>
-<p>(1 sentence)</p>
+	// Regex to find markdown links: [text](url)
+	linkRegex := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	matches := linkRegex.FindAllStringSubmatch(markdown, -1)
 
-<h2>What's New</h2>
-<p>(2-3 sentences, written like you're explaining it to a friend over coffee, with citations to papers as <a href="link">Paper Name</a>)</p>
-<ul>
-  <li>Cover all papers in a natural, flowing narrative</li>
-  <li>Group related papers together</li>
-  <li>Include key metrics and outcomes</li>
-  <li>Keep the tone light and engaging</li>
-</ul>
+	if len(matches) == 0 {
+		return ValidationError{
+			Field:    "links",
+			Message:  "no markdown links found in summary",
+			Details:  markdown,
+			Severity: SeverityError,
+		}
+	}
+
+	var warnings []string
+	var errors []string
+
+	for _, match := range matches {
+		if len(match) != 3 {
+			continue
+		}
+		text := match[1]
+		url := match[2]
+
+		// Validate URL format
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			errors = append(errors, fmt.Sprintf("%s: %s (invalid protocol)", text, url))
+			continue
+		}
+
+		// Normalize URL for comparison
+		normalizedURL := normalizeURL(url)
+		
+		// Check if normalized URL exists in feed
+		if _, exists := normalizedFeedURLs[normalizedURL]; !exists {
+			warnings = append(warnings, fmt.Sprintf("%s: %s (not in feed)", text, url))
+			continue
+		}
+	}
+
+	// Log warnings but don't fail validation
+	if len(warnings) > 0 {
+		logger.Warn("Link validation warnings",
+			"warnings", warnings,
+			"markdown", markdown)
+	}
+
+	// Return error if there are any critical issues
+	if len(errors) > 0 {
+		return ValidationError{
+			Field:    "links",
+			Message:  fmt.Sprintf("found %d invalid URLs", len(errors)),
+			Details:  fmt.Sprintf("invalid URLs: %v", errors),
+			Severity: SeverityError,
+		}
+	}
+
+	return nil
+}
+
+// validateSummaryLength checks if the summary is within reasonable bounds
+func validateSummaryLength(markdown string) error {
+	// Remove markdown links for word count
+	plainText := regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).ReplaceAllString(markdown, "$1")
+	words := strings.Fields(plainText)
+	
+	if len(words) > 1000 {
+		return ValidationError{
+			Field:    "length",
+			Message:  fmt.Sprintf("summary too long: %d words", len(words)),
+			Details:  fmt.Sprintf("max allowed: 1000, current: %d", len(words)),
+			Severity: SeverityError,
+		}
+	}
+
+	if len(words) < 50 {
+		return ValidationError{
+			Field:    "length",
+			Message:  fmt.Sprintf("summary too short: %d words", len(words)),
+			Details:  fmt.Sprintf("min expected: 50, current: %d", len(words)),
+			Severity: SeverityError,
+		}
+	}
+
+	// Log warning if summary is getting close to the limit
+	if len(words) > 800 {
+		logger.Warn("Summary approaching length limit",
+			"word_count", len(words),
+			"max_allowed", 1000)
+	}
+
+	return nil
+}
+
+// validateSummaryContent performs all validations on the summary in parallel
+func validateSummaryContent(markdown string, feedURLs map[string]string) error {
+	// Create channels for validation results
+	errChan := make(chan error, 3)
+	var wg sync.WaitGroup
+
+	// Run validations in parallel
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		if err := validateMarkdownStructure(markdown); err != nil {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := validateMarkdownLinks(markdown, feedURLs); err != nil {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := validateSummaryLength(markdown); err != nil {
+			errChan <- err
+		}
+	}()
+
+	// Wait for all validations to complete
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	// Collect errors
+	var errors []error
+	var warnings []error
+	for err := range errChan {
+		if err != nil {
+			if validationErr, ok := err.(ValidationError); ok {
+				if validationErr.Severity == SeverityWarning {
+					warnings = append(warnings, err)
+				} else {
+					errors = append(errors, err)
+				}
+			} else {
+				errors = append(errors, err)
+			}
+		}
+	}
+
+	// Log warnings
+	for _, warning := range warnings {
+		logger.Warn("Summary validation warning",
+			"warning", warning,
+			"markdown", markdown)
+	}
+
+	// Return first error if any exist
+	if len(errors) > 0 {
+		return fmt.Errorf("validation failed: %v", errors)
+	}
+
+	return nil
+}
+
+// summarizeWithLLM summarizes the markdown content using the OpenAI API
+func summarizeWithLLM(ctx context.Context, markdownContent string, feedURLs map[string]string) (string, error) {
+	apiURL := "https://api.openai.com/v1/responses"
+	apiKey := os.Getenv("OPENAI_API_KEY")
+
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENAI_API_KEY environment variable is not set")
+	}
+
+	// Construct the exact prompt as requested
+	promptText := `Create a brief morning briefing on these AI research papers, written in a conversational style for busy professionals. Focus on what's new and what it means for businesses and society.
+Format the output in markdown:
+## Morning Headline
+(1 sentence)
+## What's New 
+(2-3 sentences, written like you're explaining it to a friend over coffee, with citations to papers using the full markdown link format: [Paper Title](URL))
+
+ - Cover all papers in a natural, flowing narrative
+ - Group related papers together
+ - Include key metrics and outcomes
+ - Keep the tone light and engaging
 
 Keep it under 200 words. Start with the most impressive or important paper. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.
-
-Do not enclose the HTML in a markdown code block, just return the HTML.
-
+Do not enclose in a markdown code block, just return the markdown.
 Below are the paper abstracts and information in markdown format:
+
 ` + markdownContent
 
-	request := LLMRequest{
-		Model: "Qwen/Qwen2.5-72B-Instruct",
-		Messages: []Message{
+	// Construct the OpenAI request body
+	request := OpenAIRequest{
+		Model: "gpt-4.1-mini", // Use the specified model
+		Input: []OpenAIMessage{
 			{
-				Role:    "user",
-				Content: prompt,
+				Role: "user",
+				Content: []OpenAIContentBlock{
+					{
+						Type: "input_text",
+						Text: promptText,
+					},
+				},
 			},
 		},
-		MaxTokens:          4096,
-		Stream:             false,
-		StreamOptions: struct {
-			IncludeUsage bool `json:"include_usage"`
-		}{
-			IncludeUsage: true,
+		Text: OpenAIText{
+			Format: OpenAIFormat{
+				Type: "text",
+			},
 		},
-		Temperature:        0.6,
-		TopP:              0.95,
-		SeparateReasoning:  true,
+		Reasoning:       make(map[string]any), // Empty object
+		Tools:           make([]any, 0),      // Empty array
+		Temperature:     0.6,
+		MaxOutputTokens: 4096, // Renamed from MaxTokens
+		TopP:            0.95,
+		Store:           true,
 	}
 
 	requestBody, err := json.Marshal(request)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal LLM request: %w", err)
+		return "", fmt.Errorf("failed to marshal OpenAI request: %w", err)
 	}
 
 	// Create request with context
 	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(requestBody))
 	if err != nil {
-		return "", fmt.Errorf("failed to create LLM request: %w", err)
+		return "", fmt.Errorf("failed to create OpenAI request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey) // Use OpenAI key
 
 	// Create an HTTP client with the LLM timeout
 	client := &http.Client{
@@ -608,57 +992,130 @@ Below are the paper abstracts and information in markdown format:
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return "", fmt.Errorf("timeout calling Hugging Face Router API: %w", err)
+			return "", fmt.Errorf("timeout calling OpenAI API: %w", err)
 		}
-		return "", fmt.Errorf("failed to send request to Hugging Face Router API: %w", err)
+		return "", fmt.Errorf("failed to send request to OpenAI API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP error %d from Hugging Face Router API: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return "", fmt.Errorf("failed to decode LLM response: %w", err)
-	}
-
-	if len(llmResp.Choices) == 0 || llmResp.Choices[0].Message.Content == "" {
-		logger.Warn("LLM response contained no choices or empty content", "response", llmResp)
-		return "", fmt.Errorf("no valid response content returned from Hugging Face Router API")
-	}
-
-	response := llmResp.Choices[0].Message.Content
-
-	// Extract only the content after <think> tags if present
-	if strings.Contains(response, "<think>") {
-		parts := strings.Split(response, "</think>")
-		if len(parts) > 1 {
-			response = strings.TrimSpace(parts[len(parts)-1])
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		logger.Error("Failed to read OpenAI response body", "error", readErr)
+		// Return specific error about reading the body, but include original status code if not OK
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("HTTP error %d from OpenAI API and failed to read body: %w", resp.StatusCode, readErr)
 		}
+		return "", fmt.Errorf("failed to read OpenAI response body: %w", readErr)
 	}
 
-	return response, nil
+	// Log the raw response body for debugging
+	// logger.Info("Raw OpenAI API Response Body", "status_code", resp.StatusCode, "body", string(bodyBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		// We already logged the body, just return the error
+		return "", fmt.Errorf("HTTP error %d from OpenAI API: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// Decode the single OpenAI response object from the read bytes
+	var openAIResp OpenAIResponse // Decode into the struct, not a slice
+	if err := json.Unmarshal(bodyBytes, &openAIResp); err != nil { // Use json.Unmarshal with the byte slice
+		// Log the body again specifically on decode error
+		logger.Error("Failed to decode OpenAI response JSON", "error", err, "raw_body", string(bodyBytes))
+		return "", fmt.Errorf("failed to decode OpenAI response: %w", err)
+	}
+
+	// Extract the text content from the nested structure
+	if len(openAIResp.Output) == 0 || openAIResp.Output[0].Role != "assistant" || len(openAIResp.Output[0].Content) == 0 || openAIResp.Output[0].Content[0].Type != "output_text" {
+		// Log the parsed struct for better debugging if validation fails
+		logger.Warn("OpenAI response structure unexpected or empty after parsing", "parsedResponse", openAIResp)
+		return "", fmt.Errorf("invalid or empty response structure from OpenAI API")
+	}
+
+	// Extract the markdown text directly from the nested path
+	markdownSummary := openAIResp.Output[0].Content[0].Text
+
+	// Validate the summary content
+	if err := validateSummaryContent(markdownSummary, feedURLs); err != nil {
+		logger.Error("LLM summary validation failed",
+			"error", err,
+			"summary", markdownSummary)
+		return "", fmt.Errorf("LLM summary validation failed: %w", err)
+	}
+
+	logger.Info("Successfully validated LLM summary",
+		"summary_length", len(markdownSummary),
+		"link_count", len(regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).FindAllString(markdownSummary, -1)))
+
+	return markdownSummary, nil
 }
 
-func generateSummaryRSS(summary string, requestURL string) ([]byte, error) {
+// extractLinksFromMarkdown parses the input markdown to find ## [Title](URL) lines
+// and returns a map of title -> URL.
+func extractLinksFromMarkdown(markdownContent string) map[string]string {
+	links := make(map[string]string)
+	// Regex to find lines like ## [Title](URL)
+	// It captures the title (group 1) and the URL (group 2)
+	re := regexp.MustCompile(`(?m)^##\s*\[([^\]]+)\]\(([^)]+)\)$`)
+	matches := re.FindAllStringSubmatch(markdownContent, -1)
+	for _, match := range matches {
+		if len(match) == 3 {
+			title := strings.TrimSpace(match[1])
+			url := strings.TrimSpace(match[2])
+			links[title] = url
+			logger.Debug("Extracted link", "title", title, "url", url) // Optional: Debug log
+		}
+	}
+	return links
+}
+
+// replacePlaceholdersWithLinks replaces placeholders like [Title] in the summary
+// with actual markdown links using the provided title-URL map.
+func replacePlaceholdersWithLinks(summaryMarkdown string, links map[string]string) string {
+	// Regex to find placeholders like [Title]
+	re := regexp.MustCompile(`\[([^\]]+)\]`)
+	
+	replacedMarkdown := re.ReplaceAllStringFunc(summaryMarkdown, func(match string) string {
+		// Extract the title from the match (e.g., "[Title]" -> "Title")
+		title := strings.Trim(match, "[]")
+		// Look up the URL in the map
+		if url, ok := links[title]; ok {
+			// If found, return the proper markdown link
+			return fmt.Sprintf("[%s](%s)", title, url)
+		}
+		// If not found, return the original placeholder unchanged
+		return match
+	})
+	
+	return replacedMarkdown
+}
+
+func generateSummaryRSS(summaryMarkdown string, requestURL string, originalMarkdown string) ([]byte, error) {
 	now := time.Now().UTC()
-	
-	// Ensure the summary is properly wrapped in a div for better HTML structure
-	summary = fmt.Sprintf("<div>%s</div>", summary)
-	
+
+	// 1. Extract links from the original markdown
+	paperLinks := extractLinksFromMarkdown(originalMarkdown)
+
+	// 2. Replace placeholders in the summary markdown with actual links
+	linkedSummaryMarkdown := replacePlaceholdersWithLinks(summaryMarkdown, paperLinks)
+
+	// 3. Convert the link-replaced markdown to HTML
+	htmlBytes := md.ToHTML([]byte(linkedSummaryMarkdown), nil, nil)
+	htmlSummary := string(htmlBytes)
+
+	// 4. Wrap the HTML summary in a single div and place it in CDATA
+	wrappedHtmlSummary := fmt.Sprintf("<div>%s</div>", htmlSummary)
+
 	item := Item{
 		Title:       "AI Research Papers Summary for " + now.Format("January 2, 2006"),
 		Link:        liveURL,
-		Description: CDATA{Text: summary},
+		Description: CDATA{Text: wrappedHtmlSummary}, // Use div-wrapped HTML summary
 		PubDate:     now.Format(time.RFC1123Z),
 		GUID: GUID{
 			IsPermaLink: false,
 			Text:       fmt.Sprintf("summary-%s", now.Format("2006-01-02")),
 		},
 	}
-	
+
 	rss := RSS{
 		Version: "2.0",
 		XMLNS:   "http://www.w3.org/2005/Atom",
@@ -727,34 +1184,37 @@ func getCachedSummary(ctx context.Context, requestURL string) ([]byte, error) {
 // It now accepts a context to pass down the call chain.
 func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, error) {
 	// Get the feed content, passing context
-	// This now correctly uses the feed cache if available, or generates directly.
 	feedBytes, err := getCachedFeed(ctx, requestURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
 	
-	// Convert feed to markdown (no context needed for this part)
-	markdown, err := parseRSSToMarkdown(string(feedBytes))
+	// Convert feed to markdown
+	originalMarkdown, err := parseRSSToMarkdown(string(feedBytes))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse RSS to markdown for summary generation: %w", err)
+		return nil, fmt.Errorf("failed to parse RSS to originalMarkdown for summary generation: %w", err)
 	}
+
+	// Extract URLs from feed for validation
+	feedURLs := extractLinksFromMarkdown(originalMarkdown)
 	
 	// Summarize with LLM, passing context
-	summaryContent, err := summarizeWithLLM(ctx, markdown)
+	summaryMarkdown, err := summarizeWithLLM(ctx, originalMarkdown, feedURLs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
 	
 	// Use the original requestURL for the summary RSS self-link
-	return generateSummaryRSS(summaryContent, requestURL)
+	return generateSummaryRSS(summaryMarkdown, requestURL, originalMarkdown)
 }
 
 // Handler handles all requests
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// Initialize Redis on first request (using background context for initialization)
-	initOnce.Do(func() {
-		initRedis()
-	})
+	// initOnce.Do is now redundant as init() handles loading env and redis
+	// initOnce.Do(func() {
+	// 	initRedis() // initRedis now also handles godotenv loading via init()
+	// })
 
 	// Get the request context
 	reqCtx := r.Context()
