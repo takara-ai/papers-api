@@ -1,11 +1,11 @@
 {
   "functions": {
-    "api/*.go": {
+    "api/index.go": {
       "maxDuration": 60
     }
   },
   "routes": [
-    { "src": "/api$", "dest": "/api" },
-    { "src": "/api/(.*)", "dest": "/api" }
+    { "src": "/api$", "dest": "/api/index.go" },
+    { "src": "/api/(.*)", "dest": "/api/index.go" }
   ]
 }
