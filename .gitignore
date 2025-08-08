@@ -1,3 +1,4 @@
 .env
 .vercel
 go.sum
+.DS_Store

@@ -336,14 +336,15 @@ func scrapePapers(ctx context.Context) ([]Paper, error) {
 func generateRSS(papers []Paper, requestURL string) ([]byte, error) {
 	items := make([]Item, len(papers))
 	for i, paper := range papers {
+        tldr := toTLDRLink(paper.URL)
 		items[i] = Item{
 			Title:       paper.Title,
-			Link:        paper.URL,
+            Link:        tldr,
 			Description: CDATA{Text: paper.Abstract},
 			PubDate:     paper.PubDate.Format(time.RFC1123Z),
 			GUID: GUID{
 				IsPermaLink: true,
-				Text:       paper.URL,
+                Text:       tldr,
 			},
 		}
 	}
@@ -503,9 +504,9 @@ func updateAllCaches(ctx context.Context) error {
 		return fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
 
-	// 5. Generate summary RSS
-	// Use baseURL for the canonical requestURL
-	summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL, markdown)
+    // 5. Generate summary RSS
+    // Use baseURL for the canonical requestURL
+    summaryRSSBytes, err := generateSummaryRSS(summaryContent, baseURL, extractLinksFromMarkdown(markdown))
 	if err != nil {
 		// If summary RSS generation fails, log and return error.
 		logger.Error("Failed to generate summary RSS for cache update", "error", err)
@@ -747,6 +748,40 @@ func normalizeURL(url string) string {
 	return url
 }
 
+// deriveArxivIDFromURL tries to extract an arXiv-style ID from known sources
+// like Hugging Face papers pages (e.g., https://huggingface.co/papers/2508.03694)
+// or arXiv links (e.g., https://arxiv.org/abs/2508.03694).
+func deriveArxivIDFromURL(u string) string {
+    // Strip query/hash
+    if idx := strings.IndexByte(u, '?'); idx != -1 {
+        u = u[:idx]
+    }
+    if idx := strings.IndexByte(u, '#'); idx != -1 {
+        u = u[:idx]
+    }
+    u = strings.TrimSuffix(u, "/")
+    // Take last path segment
+    lastSlash := strings.LastIndex(u, "/")
+    if lastSlash == -1 || lastSlash+1 >= len(u) {
+        return ""
+    }
+    segment := u[lastSlash+1:]
+    // Basic sanity: allow formats like 2508.03694 or 2508.0369x (rare extensions)
+    re := regexp.MustCompile(`^[0-9]{4}\.[0-9]{4,5}[a-zA-Z0-9-]*$`)
+    if re.MatchString(segment) {
+        return segment
+    }
+    return ""
+}
+
+// toTLDRLink rewrites a paper URL to the unified TLDR route if an arXiv ID is found.
+func toTLDRLink(u string) string {
+    if id := deriveArxivIDFromURL(u); id != "" {
+        return "https://tldr.takara.ai/p/" + id
+    }
+    return u
+}
+
 // validateMarkdownLinks checks if all markdown links are properly formatted and contain URLs
 func validateMarkdownLinks(markdown string, feedURLs map[string]string) error {
 	// Create normalized feed URLs map
@@ -779,14 +814,16 @@ func validateMarkdownLinks(markdown string, feedURLs map[string]string) error {
 		text := match[1]
 		url := match[2]
 
-		// Validate URL format
-		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+        // Normalize to TLDR link if possible for validation/comparison
+        url = toTLDRLink(url)
+        // Validate URL format
+        if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			errors = append(errors, fmt.Sprintf("%s: %s (invalid protocol)", text, url))
 			continue
 		}
 
 		// Normalize URL for comparison
-		normalizedURL := normalizeURL(url)
+        normalizedURL := normalizeURL(url)
 		
 		// Check if normalized URL exists in feed
 		if _, exists := normalizedFeedURLs[normalizedURL]; !exists {
@@ -925,20 +962,21 @@ func summarizeWithLLM(ctx context.Context, markdownContent string, feedURLs map[
 		return "", fmt.Errorf("OPENAI_API_KEY environment variable is not set")
 	}
 
-	// Construct the exact prompt as requested
-	promptText := `Create a brief morning briefing on these AI research papers, written in a conversational style for busy professionals. Focus on what's new and what it means for businesses and society.
+    // Construct the exact prompt as requested
+    promptText := `Create a brief morning briefing on these AI research papers, written in a conversational style for busy professionals. Focus on what's new and what it means for businesses and society.
 Format the output in markdown:
 ## Morning Headline
 (1 sentence)
 ## What's New 
-(2-3 sentences, written like you're explaining it to a friend over coffee, with citations to papers using the full markdown link format: [Paper Title](URL))
+(2–3 sentences total, written like you're explaining it to a friend over coffee.)
 
  - Cover all papers in a natural, flowing narrative
  - Group related papers together
  - Include key metrics and outcomes
  - Keep the tone light and engaging
 
-Keep it under 200 words. Start with the most impressive or important paper. Focus on outcomes and implications, not technical details. Write like you're explaining it to a friend over coffee. Do not write a word count.
+Important: When referring to a paper, write its exact title inside square brackets like [Paper Title] and DO NOT include URLs anywhere in the output. Links will be added automatically.
+Keep it under 200 words. Start with the most impressive or important paper. Focus on outcomes and implications, not technical details. Do not write a word count.
 Do not enclose in a markdown code block, just return the markdown.
 Below are the paper abstracts and information in markdown format:
 
@@ -1031,22 +1069,28 @@ Below are the paper abstracts and information in markdown format:
 		return "", fmt.Errorf("invalid or empty response structure from OpenAI API")
 	}
 
-	// Extract the markdown text directly from the nested path
-	markdownSummary := openAIResp.Output[0].Content[0].Text
+    // Extract the markdown text directly from the nested path
+    markdownSummary := openAIResp.Output[0].Content[0].Text
 
-	// Validate the summary content
-	if err := validateSummaryContent(markdownSummary, feedURLs); err != nil {
-		logger.Error("LLM summary validation failed",
-			"error", err,
-			"summary", markdownSummary)
-		return "", fmt.Errorf("LLM summary validation failed: %w", err)
-	}
+    // Sanitize any raw URLs and programmatically inject links from the feed
+    sanitized := sanitizeSummaryMarkdown(markdownSummary)
+    // Apply a conservative headline length clamp to avoid occasional LLM overflow
+    sanitized = enforceHeadlineLength(sanitized, 200)
+    linkedMarkdown := replacePlaceholdersWithLinks(sanitized, feedURLs)
 
-	logger.Info("Successfully validated LLM summary",
-		"summary_length", len(markdownSummary),
-		"link_count", len(regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).FindAllString(markdownSummary, -1)))
+    // Validate the linked summary content
+    if err := validateSummaryContent(linkedMarkdown, feedURLs); err != nil {
+        logger.Error("LLM summary validation failed",
+            "error", err,
+            "summary", linkedMarkdown)
+        return "", fmt.Errorf("LLM summary validation failed: %w", err)
+    }
 
-	return markdownSummary, nil
+    logger.Info("Successfully validated LLM summary",
+        "summary_length", len(linkedMarkdown),
+        "link_count", len(regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).FindAllString(linkedMarkdown, -1)))
+
+    return linkedMarkdown, nil
 }
 
 // extractLinksFromMarkdown parses the input markdown to find ## [Title](URL) lines
@@ -1060,8 +1104,8 @@ func extractLinksFromMarkdown(markdownContent string) map[string]string {
 	for _, match := range matches {
 		if len(match) == 3 {
 			title := strings.TrimSpace(match[1])
-			url := strings.TrimSpace(match[2])
-			links[title] = url
+            url := strings.TrimSpace(match[2])
+            links[title] = toTLDRLink(url)
 			logger.Debug("Extracted link", "title", title, "url", url) // Optional: Debug log
 		}
 	}
@@ -1071,38 +1115,341 @@ func extractLinksFromMarkdown(markdownContent string) map[string]string {
 // replacePlaceholdersWithLinks replaces placeholders like [Title] in the summary
 // with actual markdown links using the provided title-URL map.
 func replacePlaceholdersWithLinks(summaryMarkdown string, links map[string]string) string {
-	// Regex to find placeholders like [Title]
-	re := regexp.MustCompile(`\[([^\]]+)\]`)
-	
-	replacedMarkdown := re.ReplaceAllStringFunc(summaryMarkdown, func(match string) string {
-		// Extract the title from the match (e.g., "[Title]" -> "Title")
-		title := strings.Trim(match, "[]")
-		// Look up the URL in the map
-		if url, ok := links[title]; ok {
-			// If found, return the proper markdown link
-			return fmt.Sprintf("[%s](%s)", title, url)
-		}
-		// If not found, return the original placeholder unchanged
-		return match
-	})
-	
-	return replacedMarkdown
+    // Precompute normalized maps for fuzzy matching
+    normalizeTitle := func(s string) string {
+        s = strings.ToLower(s)
+        // Replace punctuation with space
+        s = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(s, " ")
+        // Collapse whitespace
+        s = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(s, " "))
+        return s
+    }
+
+    tokenize := func(s string) []string {
+        parts := strings.Fields(s)
+        uniq := make(map[string]struct{}, len(parts))
+        out := make([]string, 0, len(parts))
+        for _, p := range parts {
+            if _, seen := uniq[p]; !seen {
+                uniq[p] = struct{}{}
+                out = append(out, p)
+            }
+        }
+        return out
+    }
+
+    jaccard := func(a, b []string) float64 {
+        if len(a) == 0 && len(b) == 0 {
+            return 1.0
+        }
+        setA := make(map[string]struct{}, len(a))
+        setB := make(map[string]struct{}, len(b))
+        for _, x := range a {
+            setA[x] = struct{}{}
+        }
+        for _, x := range b {
+            setB[x] = struct{}{}
+        }
+        inter := 0
+        for x := range setA {
+            if _, ok := setB[x]; ok {
+                inter++
+            }
+        }
+        union := len(setA)
+        for x := range setB {
+            if _, ok := setA[x]; !ok {
+                union++
+            }
+        }
+        if union == 0 {
+            return 0
+        }
+        return float64(inter) / float64(union)
+    }
+
+    normalizedToURL := make(map[string]string, len(links))
+    normalizedKeys := make([]string, 0, len(links))
+    for title, url := range links {
+        n := normalizeTitle(title)
+        normalizedToURL[n] = toTLDRLink(url)
+        normalizedKeys = append(normalizedKeys, n)
+    }
+
+    findURL := func(title string) (string, bool) {
+        n := normalizeTitle(title)
+        if url, ok := normalizedToURL[n]; ok {
+            return url, true
+        }
+        // Substring heuristic
+        for _, key := range normalizedKeys {
+            if strings.Contains(key, n) || strings.Contains(n, key) {
+                return normalizedToURL[key], true
+            }
+        }
+        // Token Jaccard heuristic
+        t := tokenize(n)
+        bestScore := 0.0
+        bestURL := ""
+        for _, key := range normalizedKeys {
+            score := jaccard(t, tokenize(key))
+            if score > bestScore {
+                bestScore = score
+                bestURL = normalizedToURL[key]
+            }
+        }
+        if bestScore >= 0.45 { // tolerant threshold for partial titles
+            return bestURL, true
+        }
+        return "", false
+    }
+
+    // Replace [Title] placeholders with links only when they are NOT already
+    // part of an existing markdown link. We do a manual scan to avoid
+    // accidental transformations inside [Title](url).
+    var builder strings.Builder
+    i := 0
+    for i < len(summaryMarkdown) {
+        if summaryMarkdown[i] == '[' {
+            // Find closing ']'
+            closeIdxRel := strings.IndexByte(summaryMarkdown[i+1:], ']')
+            if closeIdxRel == -1 {
+                // No closing ']', write the remainder and break
+                builder.WriteString(summaryMarkdown[i:])
+                break
+            }
+            closeIdx := i + 1 + closeIdxRel
+            // If immediately followed by '(', it's already a markdown link.
+            if closeIdx+1 < len(summaryMarkdown) && summaryMarkdown[closeIdx+1] == '(' {
+                // Copy the full existing link [..](..)
+                endParen := closeIdx + 2
+                for endParen < len(summaryMarkdown) && summaryMarkdown[endParen] != ')' {
+                    endParen++
+                }
+                if endParen < len(summaryMarkdown) && summaryMarkdown[endParen] == ')' {
+                    builder.WriteString(summaryMarkdown[i : endParen+1])
+                    i = endParen + 1
+                    continue
+                }
+                // If we didn't find a ')', just copy through the ']'
+                builder.WriteString(summaryMarkdown[i : closeIdx+1])
+                i = closeIdx + 1
+                continue
+            }
+            // Not already a link → attempt placeholder replacement
+            title := strings.TrimSpace(summaryMarkdown[i+1 : closeIdx])
+            if url, ok := links[title]; ok {
+                url = toTLDRLink(url)
+                builder.WriteString("[")
+                builder.WriteString(title)
+                builder.WriteString("](")
+                builder.WriteString(url)
+                builder.WriteString(")")
+                i = closeIdx + 1
+                continue
+            }
+            if url, ok := findURL(title); ok {
+                url = toTLDRLink(url)
+                builder.WriteString("[")
+                builder.WriteString(title)
+                builder.WriteString("](")
+                builder.WriteString(url)
+                builder.WriteString(")")
+                i = closeIdx + 1
+                continue
+            }
+            // No replacement available, keep as-is
+            builder.WriteString(summaryMarkdown[i : closeIdx+1])
+            i = closeIdx + 1
+            continue
+        }
+        builder.WriteByte(summaryMarkdown[i])
+        i++
+    }
+    return builder.String()
 }
 
-func generateSummaryRSS(summaryMarkdown string, requestURL string, originalMarkdown string) ([]byte, error) {
+// sanitizeSummaryMarkdown removes raw URLs that the LLM may include in-text,
+// to keep links purely programmatic and avoid duplicated "(URL)" artifacts.
+func sanitizeSummaryMarkdown(input string) string {
+    // Remove URLs in parentheses that are preceded by whitespace: " (https://...)"
+    // Require whitespace before '(' so we don't touch markdown link targets "](".
+    reParen := regexp.MustCompile(`\s+\((https?://[^)]+)\)`) // e.g., " (https://example.com)"
+    cleaned := reParen.ReplaceAllString(input, "")
+
+    // Remove angle-bracket autolinks like <https://example.com>
+    reAngle := regexp.MustCompile(`<https?://[^>]+>`)
+    cleaned = reAngle.ReplaceAllString(cleaned, "")
+
+    // Remove bare URLs with leading whitespace (avoid "](" cases as they have no whitespace)
+    reBare := regexp.MustCompile(`\s+https?://\S+`)
+    cleaned = reBare.ReplaceAllString(cleaned, "")
+
+    // Collapse repeated spaces/tabs
+    cleaned = regexp.MustCompile(`[ \t]{2,}`).ReplaceAllString(cleaned, " ")
+    return cleaned
+}
+
+// enforceHeadlineLength truncates the content under "## Morning Headline" to maxChars,
+// attempting to cut on sentence or word boundaries and appending an ellipsis if truncated.
+func enforceHeadlineLength(markdown string, maxChars int) string {
+    // 1) Find the Morning Headline heading line
+    reHeadline := regexp.MustCompile(`(?m)^##\s*Morning Headline\s*$`)
+    headlineIdx := reHeadline.FindStringIndex(markdown)
+    if headlineIdx == nil {
+        return markdown
+    }
+
+    // Content starts after the end of the headline line
+    contentStart := headlineIdx[1]
+    // Skip following newlines
+    for contentStart < len(markdown) && (markdown[contentStart] == '\n' || markdown[contentStart] == '\r') {
+        contentStart++
+    }
+
+    // 2) Find the next H2 after Morning Headline to determine section end
+    reNextH2 := regexp.MustCompile(`(?m)^##\s+`)
+    nextIdx := reNextH2.FindStringIndex(markdown[contentStart:])
+    contentEnd := len(markdown)
+    if nextIdx != nil {
+        contentEnd = contentStart + nextIdx[0]
+    }
+
+    if contentStart >= contentEnd {
+        return markdown
+    }
+
+    sectionContent := markdown[contentStart:contentEnd]
+
+    // Consider only the first paragraph for the headline
+    paraEnd := strings.Index(sectionContent, "\n\n")
+    var paragraph string
+    if paraEnd == -1 {
+        paragraph = strings.TrimSpace(sectionContent)
+    } else {
+        paragraph = strings.TrimSpace(sectionContent[:paraEnd])
+    }
+
+    // If already within limit, leave as-is but ensure only first paragraph remains in section
+    runeParagraph := []rune(paragraph)
+    if len(runeParagraph) <= maxChars {
+        rebuilt := markdown[:contentStart] + paragraph + "\n\n" + markdown[contentEnd:]
+        return rebuilt
+    }
+
+    // Truncate at sentence boundary if possible, else at last space
+    cutoff := maxChars
+    if cutoff > len(runeParagraph) {
+        cutoff = len(runeParagraph)
+    }
+    candidate := string(runeParagraph[:cutoff])
+    tail := candidate
+    if len(candidate) > 40 {
+        tail = candidate[len(candidate)-40:]
+    }
+    lastPunct := -1
+    for i := len(tail) - 1; i >= 0; i-- {
+        switch tail[i] {
+        case '.', '!', '?':
+            lastPunct = len(candidate) - (len(tail) - i)
+            i = -1
+        }
+    }
+    if lastPunct != -1 && lastPunct > maxChars/2 {
+        candidate = candidate[:lastPunct+1]
+    } else {
+        lastSpace := strings.LastIndex(candidate, " ")
+        if lastSpace > maxChars/2 {
+            candidate = candidate[:lastSpace]
+        }
+        candidate = strings.TrimRight(candidate, " ") + "…"
+    }
+
+    rebuilt := markdown[:contentStart] + strings.TrimSpace(candidate) + "\n\n" + markdown[contentEnd:]
+    return rebuilt
+}
+
+// linkBracketsInHTML converts any residual [Title] occurrences inside rendered HTML
+// into <a href="...">Title</a> using a fuzzy mapping from paper title → URL.
+// This is a final safety net if the markdown phase missed replacements.
+func linkBracketsInHTML(html string, links map[string]string) string {
+    normalizeTitle := func(s string) string {
+        s = strings.ToLower(s)
+        s = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(s, " ")
+        s = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(s, " "))
+        return s
+    }
+    tokenize := func(s string) []string { return strings.Fields(s) }
+    jaccard := func(a, b []string) float64 {
+        if len(a) == 0 && len(b) == 0 { return 1.0 }
+        setA := make(map[string]struct{}, len(a))
+        setB := make(map[string]struct{}, len(b))
+        for _, x := range a { setA[x] = struct{}{} }
+        for _, x := range b { setB[x] = struct{}{} }
+        inter := 0
+        for x := range setA { if _, ok := setB[x]; ok { inter++ } }
+        union := len(setA)
+        for x := range setB { if _, ok := setA[x]; !ok { union++ } }
+        if union == 0 { return 0 }
+        return float64(inter) / float64(union)
+    }
+
+    normalizedToURL := make(map[string]string, len(links))
+    normalizedKeys := make([]string, 0, len(links))
+    for title, url := range links {
+        n := normalizeTitle(title)
+        normalizedToURL[n] = toTLDRLink(url)
+        normalizedKeys = append(normalizedKeys, n)
+    }
+    findURL := func(title string) (string, bool) {
+        n := normalizeTitle(title)
+        if url, ok := normalizedToURL[n]; ok { return url, true }
+        for _, key := range normalizedKeys {
+            if strings.Contains(key, n) || strings.Contains(n, key) {
+                return normalizedToURL[key], true
+            }
+        }
+        t := tokenize(n)
+        best := 0.0
+        var bestURL string
+        for _, key := range normalizedKeys {
+            s := jaccard(t, tokenize(key))
+            if s > best { best = s; bestURL = normalizedToURL[key] }
+        }
+        if best >= 0.45 { return bestURL, true }
+        return "", false
+    }
+
+    // Replace occurrences of [Title] that are not already inside an anchor
+    // This is a simple pass; HTML correctness is preserved by keeping inner text only.
+    re := regexp.MustCompile(`\[([^\]]+)\]`)
+    return re.ReplaceAllStringFunc(html, func(m string) string {
+        // Skip if we detect it is already part of an anchor tag context
+        // (heuristic: presence of </a> shortly before and > before '[' is complex; rely on previous steps mostly)
+        title := strings.TrimSpace(m[1 : len(m)-1])
+        if url, ok := links[title]; ok {
+            url = toTLDRLink(url)
+            return fmt.Sprintf(`<a href="%s">%s</a>`, url, title)
+        }
+        if url, ok := findURL(title); ok {
+            url = toTLDRLink(url)
+            return fmt.Sprintf(`<a href="%s">%s</a>`, url, title)
+        }
+        return title
+    })
+}
+
+func generateSummaryRSS(summaryMarkdown string, requestURL string, paperLinks map[string]string) ([]byte, error) {
 	now := time.Now().UTC()
 
-	// 1. Extract links from the original markdown
-	paperLinks := extractLinksFromMarkdown(originalMarkdown)
+    // Convert the already-linked markdown to HTML
+    htmlBytes := md.ToHTML([]byte(summaryMarkdown), nil, nil)
+    htmlSummary := string(htmlBytes)
 
-	// 2. Replace placeholders in the summary markdown with actual links
-	linkedSummaryMarkdown := replacePlaceholdersWithLinks(summaryMarkdown, paperLinks)
+    // Fallback: in case any [Title] placeholders survived, convert them to <a> using fuzzy mapping
+    htmlSummary = linkBracketsInHTML(htmlSummary, paperLinks)
 
-	// 3. Convert the link-replaced markdown to HTML
-	htmlBytes := md.ToHTML([]byte(linkedSummaryMarkdown), nil, nil)
-	htmlSummary := string(htmlBytes)
-
-	// 4. Wrap the HTML summary in a single div and place it in CDATA
+    // Wrap the HTML summary in a single div and place it in CDATA
 	wrappedHtmlSummary := fmt.Sprintf("<div>%s</div>", htmlSummary)
 
 	item := Item{
@@ -1189,14 +1536,14 @@ func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, erro
 		return nil, fmt.Errorf("failed to get feed for summary generation: %w", err)
 	}
 	
-	// Convert feed to markdown
-	originalMarkdown, err := parseRSSToMarkdown(string(feedBytes))
+    // Convert feed to markdown
+    originalMarkdown, err := parseRSSToMarkdown(string(feedBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse RSS to originalMarkdown for summary generation: %w", err)
 	}
 
-	// Extract URLs from feed for validation
-	feedURLs := extractLinksFromMarkdown(originalMarkdown)
+    // Extract URLs from feed for validation
+    feedURLs := extractLinksFromMarkdown(originalMarkdown)
 	
 	// Summarize with LLM, passing context
 	summaryMarkdown, err := summarizeWithLLM(ctx, originalMarkdown, feedURLs)
@@ -1204,8 +1551,8 @@ func generateSummaryDirect(ctx context.Context, requestURL string) ([]byte, erro
 		return nil, fmt.Errorf("failed to summarize markdown with LLM: %w", err)
 	}
 	
-	// Use the original requestURL for the summary RSS self-link
-	return generateSummaryRSS(summaryMarkdown, requestURL, originalMarkdown)
+    // Use the original requestURL for the summary RSS self-link and provide mapping for fallback linking
+    return generateSummaryRSS(summaryMarkdown, requestURL, feedURLs)
 }
 
 // Handler handles all requests
