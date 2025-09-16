@@ -17,16 +17,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	md "github.com/gomarkdown/markdown" // Import markdown library
 	"github.com/gomarkdown/markdown/ast"
 	"github.com/gomarkdown/markdown/parser"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"github.com/rpdg/vercel_blob"
 	"golang.org/x/net/html"
 )
 
@@ -549,7 +545,7 @@ func tryGenerateConversation(ctx context.Context, text string) (*ConversationDat
         }`, text)
 
 	request := OpenAIRequest{
-		Model: "gpt-4.1-mini", // Use the specified model
+		Model: "gpt-4.1", // Use the specified model
 		Input: []OpenAIMessage{
 			{
 				Role: "user",
@@ -685,67 +681,38 @@ func getCachedConversation(ctx context.Context, text string) (string, error) {
 	return conversation, nil
 }
 
-func uploadToR2(ctx context.Context, audioData []byte) (string, error) {
+func uploadToVercelBlob(ctx context.Context, audioData []byte) (string, error) {
 	now := time.Now()
 	filename := fmt.Sprintf("%d_%02d_%02d_podcast.mp3", now.Day(), int(now.Month()), now.Year())
 
-	// Get R2 credentials from environment
-	accessKeyID := os.Getenv("R2_ACCESS_KEY_ID")
-	secretAccessKey := os.Getenv("R2_SECRET_ACCESS_KEY")
-	accountID := os.Getenv("R2_ACCOUNT_ID")
-	bucketName := os.Getenv("R2_BUCKET_NAME")
-
-	if accessKeyID == "" || secretAccessKey == "" || accountID == "" || bucketName == "" {
-		return "", fmt.Errorf("missing required R2 environment variables")
+	// Get Vercel Blob token from environment
+	blobToken := os.Getenv("BLOB_READ_WRITE_TOKEN")
+	if blobToken == "" {
+		return "", fmt.Errorf("BLOB_READ_WRITE_TOKEN environment variable is not set")
 	}
 
-	// Load AWS config with R2 credentials
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			accessKeyID,
-			secretAccessKey,
-			"",
-		)),
-		config.WithRegion("auto"), // R2 uses "auto" region
-		config.WithEndpointResolver(aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
-			if service == s3.ServiceID {
-				return aws.Endpoint{
-					PartitionID:   "aws",
-					URL:           fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID),
-					SigningRegion: "auto",
-				}, nil
-			}
-			return aws.Endpoint{}, fmt.Errorf("unknown endpoint requested")
-		})),
-	)
+	// Create a token provider
+	tokenProvider, err := vercel_blob.NewEnvTokenProvider("BLOB_READ_WRITE_TOKEN")
 	if err != nil {
-		return "", fmt.Errorf("unable to load SDK config: %w", err)
+		return "", fmt.Errorf("failed to create token provider: %w", err)
 	}
 
-	// Create S3 client
-	s3Client := s3.NewFromConfig(cfg)
+	// Create a new blob client
+	client := vercel_blob.NewVercelBlobClientExternal(tokenProvider)
 
-	// Prepare the PutObjectInput
-	putObjectInput := &s3.PutObjectInput{
-		Bucket:      aws.String(bucketName),
-		Key:         aws.String(filename),
-		Body:        bytes.NewReader(audioData),
-		ContentType: aws.String("audio/mpeg"),
-		ACL:         types.ObjectCannedACLPublicRead, // Make file publicly accessible
+	// Upload the file to Vercel Blob
+	options := vercel_blob.PutCommandOptions{
+		ContentType:     "audio/mpeg",
+		AddRandomSuffix: false, // Use predictable URLs
 	}
 
-	// Upload the object
-	_, err = s3Client.PutObject(ctx, putObjectInput)
+	response, err := client.Put(filename, bytes.NewReader(audioData), options)
 	if err != nil {
-		return "", fmt.Errorf("failed to upload to R2: %w", err)
+		return "", fmt.Errorf("failed to upload to Vercel Blob: %w", err)
 	}
 
-	// Generate public URL
-	r2_publicurl := os.Getenv("R2_PUBLIC_URL")
-	publicURL := fmt.Sprintf("%s/%s", r2_publicurl, filename)
-
-	logger.Info("Successfully uploaded to Cloudflare R2", "url", publicURL, "filename", filename)
-	return publicURL, nil
+	logger.Info("Successfully uploaded to Vercel Blob", "url", response.URL, "filename", filename)
+	return response.URL, nil
 }
 
 func generateAudioPodcast(ctx context.Context, text string) (string, error) {
@@ -817,10 +784,10 @@ func generateAudioPodcast(ctx context.Context, text string) (string, error) {
 		}
 	}
 
-	// Upload to R2 and get URL
-	blobURL, err := uploadToR2(ctx, audioBuffer.Bytes())
+	// Upload to Vercel Blob and get URL
+	blobURL, err := uploadToVercelBlob(ctx, audioBuffer.Bytes())
 	if err != nil {
-		return "", fmt.Errorf("failed to upload to R2: %w", err)
+		return "", fmt.Errorf("failed to upload to Vercel Blob: %w", err)
 	}
 	return blobURL, nil
 }
@@ -1435,7 +1402,7 @@ Below are the paper abstracts and information in markdown format:
 
 	// Construct the OpenAI request body
 	request := OpenAIRequest{
-		Model: "gpt-4.1-mini", // Use the specified model
+		Model: "gpt-4.1", // Use the specified model
 		Input: []OpenAIMessage{
 			{
 				Role: "user",
