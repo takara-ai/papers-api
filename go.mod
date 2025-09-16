@@ -8,6 +8,7 @@ require (
 	github.com/gomarkdown/markdown v0.0.0-20250311123330-531bef5e742b
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.7.0
+	github.com/rpdg/vercel_blob v0.1.0
 	golang.org/x/net v0.39.0
 )
 
